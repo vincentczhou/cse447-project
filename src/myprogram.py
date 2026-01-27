@@ -28,9 +28,9 @@ class MyModel:
 
     @classmethod
     def write_pred(cls, preds, fname):
-        with open(fname, 'wt') as f:
+        with open(fname, "wt") as f:
             for p in preds:
-                f.write('{}\n'.format(p))
+                f.write("{}\n".format(p))
 
     def run_train(self, data, work_dir):
         # your code here
@@ -43,55 +43,61 @@ class MyModel:
         for inp in data:
             # this model just predicts a random character each time
             top_guesses = [random.choice(all_chars) for _ in range(3)]
-            preds.append(''.join(top_guesses))
+            preds.append("".join(top_guesses))
         return preds
 
     def save(self, work_dir):
         # your code here
         # this particular model has nothing to save, but for demonstration purposes we will save a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint'), 'wt') as f:
-            f.write('dummy save')
+        with open(os.path.join(work_dir, "model.checkpoint"), "wt") as f:
+            f.write("dummy save")
 
     @classmethod
     def load(cls, work_dir):
         # your code here
         # this particular model has nothing to load, but for demonstration purposes we will load a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint')) as f:
+        with open(os.path.join(work_dir, "model.checkpoint")) as f:
             dummy_save = f.read()
         return MyModel()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('mode', choices=('train', 'test'), help='what to run')
-    parser.add_argument('--work_dir', help='where to save', default='work')
-    parser.add_argument('--test_data', help='path to test data', default='example/input.txt')
-    parser.add_argument('--test_output', help='path to write test predictions', default='pred.txt')
+    parser.add_argument("mode", choices=("train", "test"), help="what to run")
+    parser.add_argument("--work_dir", help="where to save", default="work")
+    parser.add_argument(
+        "--test_data", help="path to test data", default="example/input.txt"
+    )
+    parser.add_argument(
+        "--test_output", help="path to write test predictions", default="pred.txt"
+    )
     args = parser.parse_args()
 
     random.seed(0)
 
-    if args.mode == 'train':
+    if args.mode == "train":
         if not os.path.isdir(args.work_dir):
-            print('Making working directory {}'.format(args.work_dir))
+            print("Making working directory {}".format(args.work_dir))
             os.makedirs(args.work_dir)
-        print('Instatiating model')
+        print("Instatiating model")
         model = MyModel()
-        print('Loading training data')
+        print("Loading training data")
         train_data = MyModel.load_training_data()
-        print('Training')
+        print("Training")
         model.run_train(train_data, args.work_dir)
-        print('Saving model')
+        print("Saving model")
         model.save(args.work_dir)
-    elif args.mode == 'test':
-        print('Loading model')
+    elif args.mode == "test":
+        print("Loading model")
         model = MyModel.load(args.work_dir)
-        print('Loading test data from {}'.format(args.test_data))
+        print("Loading test data from {}".format(args.test_data))
         test_data = MyModel.load_test_data(args.test_data)
-        print('Making predictions')
+        print("Making predictions")
         pred = model.run_pred(test_data)
-        print('Writing predictions to {}'.format(args.test_output))
-        assert len(pred) == len(test_data), 'Expected {} predictions but got {}'.format(len(test_data), len(pred))
+        print("Writing predictions to {}".format(args.test_output))
+        assert len(pred) == len(test_data), "Expected {} predictions but got {}".format(
+            len(test_data), len(pred)
+        )
         model.write_pred(pred, args.test_output)
     else:
-        raise NotImplementedError('Unknown mode {}'.format(args.mode))
+        raise NotImplementedError("Unknown mode {}".format(args.mode))
