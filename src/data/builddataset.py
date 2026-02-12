@@ -11,21 +11,68 @@ TARGET_PER_LANG = 1000
 MIN_CHARS = 200
 MAX_CHARS = 4000
 
-MAX_PER_LANG_SCAN = 200_000   # hard cap per language
-PATIENCE_PER_LANG = 50_000    # stop if no adds for this many scanned docs
+MAX_PER_LANG_SCAN = 200_000  # hard cap per language
+PATIENCE_PER_LANG = 50_000  # stop if no adds for this many scanned docs
 
 LANGS = [
     # Western + Central European
-    "en", "es", "fr", "de", "pt", "it", "nl", "sv", "da", "no", "fi", "pl", "cs", "sk", "hu", "ro",
-    "bg", "sr", "hr", "sl", "lt", "lv", "et", "el", "uk",
+    "en",
+    "es",
+    "fr",
+    "de",
+    "pt",
+    "it",
+    "nl",
+    "sv",
+    "da",
+    "no",
+    "fi",
+    "pl",
+    "cs",
+    "sk",
+    "hu",
+    "ro",
+    "bg",
+    "sr",
+    "hr",
+    "sl",
+    "lt",
+    "lv",
+    "et",
+    "el",
+    "uk",
     # Common global
-    "ru", "ar", "he", "fa", "tr",
+    "ru",
+    "ar",
+    "he",
+    "fa",
+    "tr",
     # South/Southeast Asia
-    "hi", "bn", "ur", "ta", "te", "mr", "gu", "pa", "ne", "si", "th", "vi", "id", "ms",
+    "hi",
+    "bn",
+    "ur",
+    "ta",
+    "te",
+    "mr",
+    "gu",
+    "pa",
+    "ne",
+    "si",
+    "th",
+    "vi",
+    "id",
+    "ms",
     # East Asia
-    "zh", "ja", "ko",
+    "zh",
+    "ja",
+    "ko",
     # Africa (higher-resource)
-    "sw", "ha", "yo", "ig", "am", "so"
+    "sw",
+    "ha",
+    "yo",
+    "ig",
+    "am",
+    "so",
 ]
 
 features = Features({"lang": Value("string"), "text": Value("string")})
@@ -42,7 +89,7 @@ for lang in LANGS:
             lang,
             split="clean",
             streaming=True,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
     except Exception as e:
         rejected.append({"lang": lang, "reason": str(e).splitlines()[-1]})
@@ -83,18 +130,18 @@ out_dir = "data/madlad_multilang_clean_1k_optionB"
 os.makedirs(out_dir, exist_ok=True)
 
 if len(samples) == 0:
-    raise RuntimeError(
-        "Collected 0 samples total — check dataset access/fields.")
+    raise RuntimeError("Collected 0 samples total — check dataset access/fields.")
 
 ds_out = Dataset.from_list(samples, features=features)
 ds_out.save_to_disk(out_dir)
 
-pd.DataFrame([{"lang": l, "count": counts[l]} for l in LANGS]).to_csv(
+pd.DataFrame([{"lang": lang, "count": counts[lang]} for lang in LANGS]).to_csv(
     os.path.join(out_dir, "language_counts.csv"), index=False
 )
 
 if rejected:
-    pd.DataFrame(rejected).to_csv(os.path.join(
-        out_dir, "rejected_langs.csv"), index=False)
+    pd.DataFrame(rejected).to_csv(
+        os.path.join(out_dir, "rejected_langs.csv"), index=False
+    )
 
 print("Saved to:", out_dir)
