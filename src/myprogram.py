@@ -1,24 +1,47 @@
 #!/usr/bin/env python
+import heapq
+import json
 import os
-import string
-import random
+import re
+import unicodedata
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+
+import kenlm
+
+SPACE_TOKEN = "<sp>"
+_ws_re = re.compile(r"\s+")
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text (same as preprocess.py)"""
+    text = unicodedata.normalize("NFC", text)
+    text = text.lower()
+    text = _ws_re.sub(" ", text).strip()
+    return text
+
+
+def input_to_tokens(text: str) -> list[str]:
+    """Convert raw input to character tokens"""
+    normalized = normalize_text(text)
+    return [SPACE_TOKEN if ch == " " else ch for ch in normalized]
 
 
 class MyModel:
     """
-    This is a starter model to get you started. Feel free to modify this file.
+    KenLM character-level n-gram model for next-character prediction.
     """
+
+    def __init__(self):
+        self.model = None
+        self.vocab = None
 
     @classmethod
     def load_training_data(cls):
-        # your code here
-        # this particular model doesn't train
+        # KenLM training is done offline with lmplz
         return []
 
     @classmethod
     def load_test_data(cls, fname):
-        # your code here
         data = []
         with open(fname) as f:
             for line in f:
@@ -33,17 +56,45 @@ class MyModel:
                 f.write("{}\n".format(p))
 
     def run_train(self, data, work_dir):
-        # your code here
+        # KenLM training is done offline with lmplz
         pass
 
+    def _build_state(self, tokens):
+        """Feed tokens into model and return the resulting state."""
+        state = kenlm.State()
+        self.model.BeginSentenceWrite(state)
+        out_state = kenlm.State()
+        for token in tokens:
+            self.model.BaseScore(state, token, out_state)
+            state, out_state = out_state, state
+        return state
+
     def run_pred(self, data):
-        # your code here
+        """Predict top 3 next characters for each input."""
         preds = []
-        all_chars = string.ascii_letters
         for inp in data:
-            # this model just predicts a random character each time
-            top_guesses = [random.choice(all_chars) for _ in range(3)]
-            preds.append("".join(top_guesses))
+            tokens = input_to_tokens(inp)
+            state = self._build_state(tokens)
+
+            # Score all vocab candidates from the same context state
+            out_state = kenlm.State()
+            scored = []
+            for token in self.vocab:
+                log_prob = self.model.BaseScore(state, token, out_state)
+                scored.append((log_prob, token))
+
+            # Get top 3 by log probability
+            top3 = heapq.nlargest(3, scored, key=lambda x: x[0])
+
+            # Convert tokens back to characters
+            chars = []
+            for _, token in top3:
+                if token == SPACE_TOKEN:
+                    chars.append(" ")
+                else:
+                    chars.append(token)
+
+            preds.append("".join(chars))
         return preds
 
     def save(self, work_dir):
@@ -54,11 +105,28 @@ class MyModel:
 
     @classmethod
     def load(cls, work_dir):
-        # your code here
-        # this particular model has nothing to load, but for demonstration purposes we will load a blank file
-        with open(os.path.join(work_dir, "model.checkpoint")) as f:
-            dummy_save = f.read()
-        return MyModel()
+        """Load KenLM binary model and vocabulary."""
+        instance = cls()
+
+        # Load KenLM model
+        model_path = os.path.join(work_dir, "char6.binary")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"KenLM model not found at {model_path}")
+        print(f"Loading KenLM model from {model_path}")
+        instance.model = kenlm.Model(model_path)
+
+        # Load vocabulary
+        vocab_path = os.path.join(work_dir, "vocab.json")
+        if not os.path.exists(vocab_path):
+            raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+        print(f"Loading vocabulary from {vocab_path}")
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            vocab_dict = json.load(f)
+        # Exclude KenLM special tokens from candidates
+        instance.vocab = [t for t in vocab_dict.keys() if t not in ("<s>", "</s>")]
+
+        print(f"Model order: {instance.model.order}, Vocab size: {len(instance.vocab)}")
+        return instance
 
 
 if __name__ == "__main__":
@@ -73,13 +141,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    random.seed(0)
-
     if args.mode == "train":
         if not os.path.isdir(args.work_dir):
             print("Making working directory {}".format(args.work_dir))
             os.makedirs(args.work_dir)
-        print("Instatiating model")
+        print("Instantiating model")
         model = MyModel()
         print("Loading training data")
         train_data = MyModel.load_training_data()
