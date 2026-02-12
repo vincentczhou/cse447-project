@@ -3,3 +3,6 @@ work/
 output/
 submit/
 submit.zip
+
+# Added
+src/data/data/*
