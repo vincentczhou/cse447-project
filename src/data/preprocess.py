@@ -1,4 +1,6 @@
+from collections import Counter
 from datasets import Dataset
+import json
 from pathlib import Path
 import random
 import re
@@ -33,9 +35,11 @@ rng = random.Random(SEED)
 
 train_path = OUTPUT_DIR / "train.txt"
 valid_path = OUTPUT_DIR / "valid.txt"
+vocab_path = OUTPUT_DIR / "vocab.json"
 
 train_lines = []
 valid_lines = []
+vocab = Counter()
 
 for ex in tqdm(ds, desc="Processing examples"):
     text = ex.get("text")
@@ -47,6 +51,11 @@ for ex in tqdm(ds, desc="Processing examples"):
         continue
 
     tokenized = char_tokenize(norm)
+
+    # Count token frequencies for vocabulary (after tokenization)
+    tokens = tokenized.split()
+    vocab.update(tokens)
+
     if rng.random() < VALID_RATIO:
         valid_lines.append(tokenized)
     else:
@@ -58,5 +67,11 @@ with train_path.open("w", encoding="utf-8") as f:
 with valid_path.open("w", encoding="utf-8") as f:
     f.write("\n".join(valid_lines) + "\n")
 
+# Write vocabulary file as JSON (sorted by count descending)
+vocab_dict = {token: count for token, count in vocab.most_common()}
+with vocab_path.open("w", encoding="utf-8") as f:
+    json.dump(vocab_dict, f, ensure_ascii=False, indent=2)
+
 print(f"Wrote {len(train_lines)} train lines to {train_path}")
 print(f"Wrote {len(valid_lines)} valid lines to {valid_path}")
+print(f"Wrote {len(vocab)} unique characters to {vocab_path}")
