@@ -5,11 +5,16 @@ import os
 import re
 import unicodedata
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from multiprocessing import Pool, cpu_count
 
 import kenlm
 
 SPACE_TOKEN = "<sp>"
 _ws_re = re.compile(r"\s+")
+
+# Global variables for worker processes (each worker loads its own model)
+_worker_model = None
+_worker_vocab = None
 
 
 def normalize_text(text: str) -> str:
@@ -26,6 +31,46 @@ def input_to_tokens(text: str) -> list[str]:
     return [SPACE_TOKEN if ch == " " else ch for ch in normalized]
 
 
+def _worker_init(model_path: str, vocab: list[str]):
+    """Initialize KenLM model in each worker process."""
+    global _worker_model, _worker_vocab
+    _worker_model = kenlm.Model(model_path)
+    _worker_vocab = vocab
+
+
+def _predict_single(inp: str) -> str:
+    """Predict top 3 next characters for a single input. Runs in worker process."""
+    tokens = input_to_tokens(inp)
+
+    # Build context state
+    state = kenlm.State()
+    _worker_model.BeginSentenceWrite(state)
+    out_state = kenlm.State()
+    for token in tokens:
+        _worker_model.BaseScore(state, token, out_state)
+        state, out_state = out_state, state
+
+    # Score all vocab candidates from the same context state
+    out_state = kenlm.State()
+    scored = []
+    for token in _worker_vocab:
+        log_prob = _worker_model.BaseScore(state, token, out_state)
+        scored.append((log_prob, token))
+
+    # Get top 3 by log probability
+    top3 = heapq.nlargest(3, scored, key=lambda x: x[0])
+
+    # Convert tokens back to characters
+    chars = []
+    for _, token in top3:
+        if token == SPACE_TOKEN:
+            chars.append(" ")
+        else:
+            chars.append(token)
+
+    return "".join(chars)
+
+
 class MyModel:
     """
     KenLM character-level n-gram model for next-character prediction.
@@ -34,6 +79,7 @@ class MyModel:
     def __init__(self):
         self.model = None
         self.vocab = None
+        self.model_path = None
 
     @classmethod
     def load_training_data(cls):
@@ -59,42 +105,26 @@ class MyModel:
         # KenLM training is done offline with lmplz
         pass
 
-    def _build_state(self, tokens):
-        """Feed tokens into model and return the resulting state."""
-        state = kenlm.State()
-        self.model.BeginSentenceWrite(state)
-        out_state = kenlm.State()
-        for token in tokens:
-            self.model.BaseScore(state, token, out_state)
-            state, out_state = out_state, state
-        return state
-
     def run_pred(self, data):
         """Predict top 3 next characters for each input."""
-        preds = []
-        for inp in data:
-            tokens = input_to_tokens(inp)
-            state = self._build_state(tokens)
+        num_workers = min(cpu_count(), 8)
 
-            # Score all vocab candidates from the same context state
-            out_state = kenlm.State()
-            scored = []
-            for token in self.vocab:
-                log_prob = self.model.BaseScore(state, token, out_state)
-                scored.append((log_prob, token))
+        if len(data) < 100 or num_workers <= 1:
+            # Sequential for small datasets
+            global _worker_model, _worker_vocab
+            _worker_model = self.model
+            _worker_vocab = self.vocab
+            return [_predict_single(inp) for inp in data]
 
-            # Get top 3 by log probability
-            top3 = heapq.nlargest(3, scored, key=lambda x: x[0])
-
-            # Convert tokens back to characters
-            chars = []
-            for _, token in top3:
-                if token == SPACE_TOKEN:
-                    chars.append(" ")
-                else:
-                    chars.append(token)
-
-            preds.append("".join(chars))
+        # Parallel for large datasets
+        print(f"Using {num_workers} workers for {len(data)} inputs")
+        chunk_size = max(1, len(data) // (num_workers * 4))
+        with Pool(
+            processes=num_workers,
+            initializer=_worker_init,
+            initargs=(self.model_path, self.vocab),
+        ) as pool:
+            preds = pool.map(_predict_single, data, chunksize=chunk_size)
         return preds
 
     def save(self, work_dir):
@@ -113,6 +143,7 @@ class MyModel:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"KenLM model not found at {model_path}")
         print(f"Loading KenLM model from {model_path}")
+        instance.model_path = model_path
         instance.model = kenlm.Model(model_path)
 
         # Load vocabulary
