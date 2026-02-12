@@ -10,6 +10,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "datasets==3.6.0",
     "pre-commit>=4.5.1",
     "ruff>=0.14.14",
 ]

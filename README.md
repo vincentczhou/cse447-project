@@ -1,3 +1,15 @@
+# Notes (Spec Below)
+
+to setup
+
+Install KenLM, run
+```
+uv sync
+uv run pre-commit install
+```
+
+
+
 # CSE447-project
 
 This repo contains an example submission for the CSE447 project.
