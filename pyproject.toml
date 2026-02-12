@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.10"
 dependencies = [
+    "kenlm",
     "seaborn>=0.13.2",
 ]
 
@@ -12,3 +13,6 @@ dev = [
     "pre-commit>=4.5.1",
     "ruff>=0.14.14",
 ]
+
+[tool.uv.sources]
+kenlm = { git = "https://github.com/kpu/kenlm.git" }
