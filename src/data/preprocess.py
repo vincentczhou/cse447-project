@@ -2,6 +2,7 @@ from datasets import Dataset
 from pathlib import Path
 import random
 import re
+import unicodedata
 from tqdm import tqdm
 
 SEED = 42
@@ -16,6 +17,7 @@ _ws_re = re.compile(r"\s+")
 
 
 def normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
     text = text.lower()
     text = _ws_re.sub(" ", text).strip()
     return text
