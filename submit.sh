@@ -37,12 +37,14 @@ rsync -a \
 	--exclude="example/" \
 	--exclude="grader/" \
 	--exclude="work/" \
+	--exclude="wandb/" \
 	--exclude=".dockerignore" \
 	--exclude=".gitignore" \
 	--exclude=".pre-commit-config.yaml" \
 	--exclude="submit.sh" \
 	--exclude="submit/" \
 	--exclude="submit.zip" \
+    # --exclude=".env" \
 	./ submit/
 
 # submit selected work files (edit this list each time)
