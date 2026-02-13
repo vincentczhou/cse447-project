@@ -30,6 +30,7 @@ uv run python src/myprogram.py test --work_dir work --test_data example/input.tx
 rsync -a \
 	--exclude=".git/" \
 	--exclude="*.md" \
+    --exclude="__pycache__/" \
     --exclude="*.pyc" \
 	--exclude=".ruff_cache/" \
 	--exclude=".venv/" \
@@ -44,8 +45,8 @@ rsync -a \
 	--exclude="submit.sh" \
 	--exclude="submit/" \
 	--exclude="submit.zip" \
-    # --exclude=".env" \
 	./ submit/
+    # --exclude=".env" \
 
 # submit selected work files (edit this list each time)
 WORK_FILES=(

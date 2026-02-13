@@ -25,6 +25,13 @@ WORKDIR /job
 
 # Copy project files and install dependencies
 COPY pyproject.toml uv.lock .python-version ./
+
+# Copy config files
+COPY data_config.yaml config.yaml ./
+
+# Copy .env files
+COPY .env ./
+
 # Make sure torch is still visible in the venv
 RUN uv venv --system-site-packages --clear
 RUN uv sync --frozen --no-cache --no-dev
