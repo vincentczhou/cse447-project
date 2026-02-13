@@ -36,6 +36,7 @@ rsync -a \
 	--exclude="data/" \
 	--exclude="example/" \
 	--exclude="grader/" \
+    --exclude="scripts/" \
 	--exclude="work/" \
 	--exclude=".dockerignore" \
 	--exclude=".gitignore" \
