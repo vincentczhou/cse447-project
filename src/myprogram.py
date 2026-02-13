@@ -13,7 +13,7 @@ import yaml
 from utils.text_utils import SPACE_TOKEN, input_to_tokens
 
 # Load config
-_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 with _CONFIG_PATH.open("r", encoding="utf-8") as _f:
     CONFIG = yaml.safe_load(_f)
 

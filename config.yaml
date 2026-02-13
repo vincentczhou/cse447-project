@@ -1,8 +1,8 @@
 # Inference configuration for myprogram.py
 
 model:
-  binary: char6.binary        # KenLM binary model filename (relative to work_dir)
-  vocab: vocab.json            # Vocabulary JSON filename (relative to work_dir)
+  binary: 15k_char6_000122.binary        # KenLM binary model filename (relative to work_dir)
+  vocab: 15k_vocab.json            # Vocabulary JSON filename (relative to work_dir)
   exclude_tokens:              # KenLM special tokens to exclude from candidates
     - "<s>"
     - "</s>"
