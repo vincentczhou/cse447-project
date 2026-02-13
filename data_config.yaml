@@ -66,7 +66,6 @@ builddataset:
 preprocess:
   seed: 42
   valid_ratio: 0.01
-  space_token: "<sp>"
   flush_interval: 10000
   input_dir: madlad_multilang_clean_15k_optionB
   output_dir: madlad_multilang_clean_15k_optionB_kenlm
