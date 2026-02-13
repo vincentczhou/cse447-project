@@ -1,0 +1,17 @@
+# Inference configuration for myprogram.py
+
+model:
+  binary: 15k_char6_000122.binary        # KenLM binary model filename (relative to work_dir)
+  vocab: 15k_vocab.json            # Vocabulary JSON filename (relative to work_dir)
+  exclude_tokens:              # KenLM special tokens to exclude from candidates
+    - "<s>"
+    - "</s>"
+
+prediction:
+  top_k: 3                     # Number of top predictions to return
+  fallback: " ea"              # Default prediction when errors occur (most common chars)
+
+workers:
+  max_workers: 8               # Maximum number of parallel workers
+  sequential_threshold: 100    # Use sequential mode below this many inputs
+  chunk_divisor: 4             # chunksize = len(data) // (num_workers * chunk_divisor)

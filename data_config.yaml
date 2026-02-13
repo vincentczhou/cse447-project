@@ -1,0 +1,71 @@
+data_dir: data
+
+builddataset:
+  seed: 42
+  target_per_lang: 15000
+  min_chars: 200
+  max_chars: 4000
+  max_per_lang_scan: 200000
+  patience_per_lang: 50000
+  output_dir: madlad_multilang_clean_15k_optionB
+  langs:
+    - en
+    - es
+    - fr
+    - de
+    - pt
+    - it
+    - nl
+    - sv
+    - da
+    - no
+    - fi
+    - pl
+    - cs
+    - sk
+    - hu
+    - ro
+    - bg
+    - sr
+    - hr
+    - sl
+    - lt
+    - lv
+    - et
+    - el
+    - uk
+    - ru
+    - ar
+    - he
+    - fa
+    - tr
+    - hi
+    - bn
+    - ur
+    - ta
+    - te
+    - mr
+    - gu
+    - pa
+    - ne
+    - si
+    - th
+    - vi
+    - id
+    - ms
+    - zh
+    - ja
+    - ko
+    - sw
+    - ha
+    - yo
+    - ig
+    - am
+    - so
+
+preprocess:
+  seed: 42
+  valid_ratio: 0.01
+  flush_interval: 10000
+  input_dir: madlad_multilang_clean_15k_optionB
+  output_dir: madlad_multilang_clean_15k_optionB_kenlm
