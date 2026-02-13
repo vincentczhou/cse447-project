@@ -71,7 +71,7 @@ Once preprocessing is complete, build a KenLM language model:
 # Install KenLM first (if not already installed)
 # See: https://github.com/kpu/kenlm
 
-cd data/madlad_multilang_clean_1k_optionB_kenlm
+cd ../../data/madlad_multilang_clean_1k_optionB_kenlm
 
 # Build a 5-gram model
 lmplz -o 5 < train.txt > model_5gram.arpa
@@ -82,9 +82,10 @@ build_binary model_5gram.arpa model_5gram.bin
 
 ## Configuration
 
-### `builddataset.py` Parameters
+All dataset and preprocessing settings live in the repo root:
+- [data_config.yaml](../../data_config.yaml)
 
-Edit these constants at the top of the file:
+### `builddataset.py` Parameters
 
 ```python
 TARGET_PER_LANG = 1000        # Samples to collect per language
@@ -98,8 +99,6 @@ SEED = 42                     # Random seed for reproducibility
 To add/remove languages, edit the `LANGS` list.
 
 ### `preprocess.py` Parameters
-
-Edit these constants at the top of the file:
 
 ```python
 VALID_RATIO = 0.01                        # Fraction for validation split
@@ -130,7 +129,7 @@ Each character becomes a space-separated token. Spaces in the original text are 
 ```python
 from datasets import Dataset
 
-# Load the built dataset
+# Load the built dataset (paths are relative to repo root)
 ds = Dataset.load_from_disk("data/madlad_multilang_clean_1k_optionB")
 print(ds)
 print(ds[0])  # First example with 'lang' and 'text' fields

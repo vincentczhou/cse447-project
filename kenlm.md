@@ -4,7 +4,7 @@
 
 - **Model**: Character-level 6-gram, binarized as `work/char6.binary` (probing hash tables)
 - **ARPA source**: `src/char6_pruned.arpa` / `work/char6_pruned.arpa`
-- **Vocab**: 13,694 unique character tokens in `src/data/data/madlad_multilang_clean_1k_optionB_kenlm/vocab.json`
+- **Vocab**: 13,694 unique character tokens in `data/madlad_multilang_clean_1k_optionB_kenlm/vocab.json`
 - **Training data**: ~141M tokens from MADLAD multilingual dataset
 - **Pruning**: `--prune 0 0 0 1 2 2` (prune 4/5/6-gram singletons/rare)
 - **Ngram counts**: 1=13,685 | 2=713,843 | 3=2,980,433 | 4=3,165,582 | 5=4,486,426 | 6=7,096,536
@@ -152,7 +152,7 @@ class MyModel:
 | ------------------------------ | ------------------------------------------------------------ |
 | `work/char6.binary`            | Binarized KenLM model (probing hash tables)                  |
 | `work/char6_pruned.arpa`       | ARPA text-format model                                       |
-| `src/data/data/.../vocab.json` | `{token: count}` sorted by frequency descending              |
+| `data/.../vocab.json` | `{token: count}` sorted by frequency descending              |
 | `src/myprogram.py`             | Main program (needs KenLM integration)                       |
 | `src/predict.sh`               | Entry point: `uv run python src/myprogram.py test ...`       |
 | `src/data/preprocess.py`       | Preprocessing: normalize → char tokenize → train/valid/vocab |

@@ -1,79 +1,30 @@
 from datasets import load_dataset, Dataset, Features, Value
 from collections import defaultdict
+from pathlib import Path
 import random
-import os
 import pandas as pd
+import yaml
 
-SEED = 42
+BASE_DIR = Path(__file__).resolve().parents[2]
+CONFIG_PATH = BASE_DIR / "data_config.yaml"
+
+with CONFIG_PATH.open("r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+DATA_DIR = BASE_DIR / config["data_dir"]
+build_cfg = config["builddataset"]
+
+SEED = build_cfg["seed"]
 random.seed(SEED)
 
-TARGET_PER_LANG = 1000
-MIN_CHARS = 200
-MAX_CHARS = 4000
+TARGET_PER_LANG = build_cfg["target_per_lang"]
+MIN_CHARS = build_cfg["min_chars"]
+MAX_CHARS = build_cfg["max_chars"]
 
-MAX_PER_LANG_SCAN = 200_000  # hard cap per language
-PATIENCE_PER_LANG = 50_000  # stop if no adds for this many scanned docs
+MAX_PER_LANG_SCAN = build_cfg["max_per_lang_scan"]
+PATIENCE_PER_LANG = build_cfg["patience_per_lang"]
 
-LANGS = [
-    # Western + Central European
-    "en",
-    "es",
-    "fr",
-    "de",
-    "pt",
-    "it",
-    "nl",
-    "sv",
-    "da",
-    "no",
-    "fi",
-    "pl",
-    "cs",
-    "sk",
-    "hu",
-    "ro",
-    "bg",
-    "sr",
-    "hr",
-    "sl",
-    "lt",
-    "lv",
-    "et",
-    "el",
-    "uk",
-    # Common global
-    "ru",
-    "ar",
-    "he",
-    "fa",
-    "tr",
-    # South/Southeast Asia
-    "hi",
-    "bn",
-    "ur",
-    "ta",
-    "te",
-    "mr",
-    "gu",
-    "pa",
-    "ne",
-    "si",
-    "th",
-    "vi",
-    "id",
-    "ms",
-    # East Asia
-    "zh",
-    "ja",
-    "ko",
-    # Africa (higher-resource)
-    "sw",
-    "ha",
-    "yo",
-    "ig",
-    "am",
-    "so",
-]
+LANGS = build_cfg["langs"]
 
 features = Features({"lang": Value("string"), "text": Value("string")})
 
@@ -126,22 +77,20 @@ for lang in LANGS:
 print("\nCounts summary:", dict(counts))
 print("Total samples:", len(samples))
 
-out_dir = "data/madlad_multilang_clean_1k_optionB"
-os.makedirs(out_dir, exist_ok=True)
+out_dir = DATA_DIR / build_cfg["output_dir"]
+out_dir.mkdir(parents=True, exist_ok=True)
 
 if len(samples) == 0:
     raise RuntimeError("Collected 0 samples total — check dataset access/fields.")
 
 ds_out = Dataset.from_list(samples, features=features)
-ds_out.save_to_disk(out_dir)
+ds_out.save_to_disk(str(out_dir))
 
 pd.DataFrame([{"lang": lang, "count": counts[lang]} for lang in LANGS]).to_csv(
-    os.path.join(out_dir, "language_counts.csv"), index=False
+    out_dir / "language_counts.csv", index=False
 )
 
 if rejected:
-    pd.DataFrame(rejected).to_csv(
-        os.path.join(out_dir, "rejected_langs.csv"), index=False
-    )
+    pd.DataFrame(rejected).to_csv(out_dir / "rejected_langs.csv", index=False)
 
 print("Saved to:", out_dir)

@@ -10,7 +10,7 @@ uv run pre-commit install
 
 training with kenlm
 ```
-lmplz --verbose_header -o 6 --prune 0 0 0 1 2 2 < data/data/madlad_multilang_clean_1k_optionB_kenlm/train.txt > char6_pruned.arpa
+lmplz --verbose_header -o 6 --prune 0 0 0 1 2 2 < data/madlad_multilang_clean_1k_optionB_kenlm/train.txt > char6_pruned.arpa
 build_binary char6_pruned.arpa char6.binaryu
 ```
 
