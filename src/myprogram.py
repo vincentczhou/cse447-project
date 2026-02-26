@@ -8,9 +8,14 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import kenlm
+import wandb
 import yaml
+from dotenv import load_dotenv
 
 from utils.text_utils import SPACE_TOKEN, input_to_tokens
+
+# Load .env file (for WANDB_API_KEY, etc.)
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # Load config
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -25,6 +30,7 @@ EXCLUDE_TOKENS = set(CONFIG["model"]["exclude_tokens"])
 MAX_WORKERS = CONFIG["workers"]["max_workers"]
 SEQUENTIAL_THRESHOLD = CONFIG["workers"]["sequential_threshold"]
 CHUNK_DIVISOR = CONFIG["workers"]["chunk_divisor"]
+WANDB_CFG = CONFIG.get("wandb", {})
 
 # Global variables for worker processes (each worker loads its own model)
 _worker_model = None
@@ -207,6 +213,33 @@ if __name__ == "__main__":
                 "Expected {} predictions but got {}".format(len(test_data), len(pred))
             )
             model.write_pred(pred, args.test_output)
+
+            # Log to wandb
+            if WANDB_CFG.get("enabled", False):
+                if WANDB_CFG.get("silent", False):
+                    os.environ["WANDB_SILENT"] = "true"
+                # Fall back to offline mode if no API key is available
+                if not os.environ.get("WANDB_API_KEY"):
+                    os.environ["WANDB_MODE"] = "offline"
+                wandb.init(
+                    project=WANDB_CFG.get("project", "cse447-kenlm"),
+                    entity=WANDB_CFG.get("entity"),
+                    config={
+                        "model_binary": MODEL_BINARY,
+                        "vocab_file": VOCAB_FILE,
+                        "top_k": TOP_K,
+                        "model_order": model.model.order,
+                        "vocab_size": len(model.vocab),
+                        "num_inputs": len(test_data),
+                    },
+                )
+                table = wandb.Table(columns=["index", "input", "prediction"])
+                for i, (inp, p) in enumerate(zip(test_data, pred)):
+                    table.add_data(i, inp, p)
+                wandb.log({"predictions": table})
+                wandb.finish()
+                # print("Logged predictions to wandb")
+                # TODO: LOG ACCURACY!
         except Exception as e:
             print(f"Error during test: {e}")
             traceback.print_exc()
