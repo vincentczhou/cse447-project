@@ -1,22 +1,20 @@
 #!/usr/bin/env python
 """
-Gemini API character-level next-character predictor (async version).
+Gemini API character-level next-character predictor (sequential version).
 
 Sends one API request per input using structured JSON output with separate
 fields for 1st, 2nd, and 3rd most likely next characters.
-Uses asyncio concurrency for high throughput.
+Processes inputs sequentially (no async/concurrency).
 
 Usage:
-    python src/scripts/gemini_predictor.py \
+    python src/scripts/gemini_predictor_sync.py \
         --input  example/input.txt \
         --output output/gemini_pred.txt \
         --answer example/answer.txt   # optional – prints accuracy
         --sample 100                  # optional – randomly sample N inputs
-        --concurrency 20              # optional – max parallel requests
 """
 
 import argparse
-import asyncio
 import json
 import os
 import random
@@ -57,7 +55,6 @@ RESPONSE_SCHEMA = {
 
 FALLBACK_PRED = " ea"
 CONTEXT_LIMIT = 200  # max chars of each input to include in prompt
-DEFAULT_CONCURRENCY = 20
 
 
 def build_prompt(text: str) -> str:
@@ -79,39 +76,34 @@ def parse_response(raw: str) -> str:
         return FALLBACK_PRED
 
 
-async def predict_single(
+def predict_single(
     client: genai.Client,
     text: str,
-    semaphore: asyncio.Semaphore,
     config: types.GenerateContentConfig,
 ) -> tuple[str, float]:
-    """Send one async API request for a single input."""
+    """Send one synchronous API request for a single input."""
     prompt = build_prompt(text)
-    async with semaphore:
-        t0 = time.perf_counter()
-        try:
-            resp = await client.aio.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=config,
-            )
-            raw = resp.text if resp.text else ""
-        except Exception as e:
-            print(f"  [error] API call failed: {e}", file=sys.stderr)
-            raw = ""
-        elapsed = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    try:
+        resp = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=config,
+        )
+        raw = resp.text if resp.text else ""
+    except Exception as e:
+        print(f"  [error] API call failed: {e}", file=sys.stderr)
+        raw = ""
+    elapsed = time.perf_counter() - t0
+
     return parse_response(raw), elapsed
 
 
-async def predict_all_async(
-    client: genai.Client, inputs: list[str], concurrency: int
-) -> tuple[list[str], float]:
-    """Predict all inputs with bounded async concurrency."""
-    print(
-        f"  {len(inputs)} inputs → {len(inputs)} API call(s) (concurrency={concurrency})"
-    )
+def predict_all(client: genai.Client, inputs: list[str]) -> tuple[list[str], float]:
+    """Predict all inputs sequentially, one at a time."""
+    print(f"  {len(inputs)} inputs → {len(inputs)} API call(s) (sequential)")
 
-    semaphore = asyncio.Semaphore(concurrency)
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=0.0,
@@ -121,29 +113,16 @@ async def predict_all_async(
         response_schema=RESPONSE_SCHEMA,
     )
 
-    completed = 0
-    total = len(inputs)
-    wall_start = time.perf_counter()
+    all_preds: list[str] = []
+    total_time = 0.0
+    for i, text in enumerate(inputs):
+        pred, elapsed = predict_single(client, text, config)
+        all_preds.append(pred)
+        total_time += elapsed
+        if (i + 1) % 50 == 0 or i == len(inputs) - 1:
+            print(f"  [{i + 1}/{len(inputs)}] {total_time:.1f}s elapsed", flush=True)
 
-    async def _predict_and_track(idx: int, text: str) -> tuple[int, str, float]:
-        nonlocal completed
-        pred, elapsed = await predict_single(client, text, semaphore, config)
-        completed += 1
-        if completed % 200 == 0 or completed == total:
-            wall = time.perf_counter() - wall_start
-            print(f"  [{completed}/{total}] {wall:.1f}s wall time", flush=True)
-        return idx, pred, elapsed
-
-    tasks = [_predict_and_track(i, text) for i, text in enumerate(inputs)]
-    results = await asyncio.gather(*tasks)
-
-    wall_time = time.perf_counter() - wall_start
-
-    # Sort by index to preserve order
-    results_sorted = sorted(results, key=lambda x: x[0])
-    preds = [r[1] for r in results_sorted]
-
-    return preds, wall_time
+    return all_preds, total_time
 
 
 def load_lines(path: str) -> list[str]:
@@ -163,7 +142,9 @@ def grade(preds: list[str], golds: list[str], verbose: bool = False) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Gemini character-level predictor")
+    parser = argparse.ArgumentParser(
+        description="Gemini character-level predictor (sequential)"
+    )
     parser.add_argument("--input", required=True, help="Path to input.txt")
     parser.add_argument("--output", default="output/gemini_pred.txt")
     parser.add_argument("--answer", default=None, help="Path to answer.txt (optional)")
@@ -173,12 +154,6 @@ def main():
         type=int,
         default=None,
         help="Randomly sample N inputs (for benchmarking large datasets)",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=DEFAULT_CONCURRENCY,
-        help=f"Max parallel API requests (default: {DEFAULT_CONCURRENCY})",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -206,8 +181,8 @@ def main():
 
     print(f"Inputs: {len(inputs)} lines\n")
 
-    # ── Predict (async, 1 API call per input) ──────────────────────────────
-    preds, elapsed = asyncio.run(predict_all_async(client, inputs, args.concurrency))
+    # ── Predict (sequential, 1 API call per input) ─────────────────────────
+    preds, elapsed = predict_all(client, inputs)
 
     # ── Write predictions ──────────────────────────────────────────────────
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
