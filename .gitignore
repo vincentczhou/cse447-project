@@ -6,3 +6,5 @@ submit.zip
 
 # Added
 /data/
+.env
+wandb/

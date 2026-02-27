@@ -15,3 +15,9 @@ workers:
   max_workers: 8               # Maximum number of parallel workers
   sequential_threshold: 100    # Use sequential mode below this many inputs
   chunk_divisor: 4             # chunksize = len(data) // (num_workers * chunk_divisor)
+
+wandb:
+  enabled: true
+  project: cse447
+  entity: vincentczhou-university-of-washington
+  silent: true                 # Suppress wandb console output
