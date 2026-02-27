@@ -26,11 +26,29 @@ PATIENCE_PER_LANG = build_cfg["patience_per_lang"]
 
 LANGS = build_cfg["langs"]
 
+SHARD_ROWS = build_cfg.get("shard_rows", 20000)  # adjust if needed
+shard_idx = 0
+buffer = []
+
+out_dir = DATA_DIR / build_cfg["output_dir"]
+out_dir.mkdir(parents=True, exist_ok=True)
+
 features = Features({"lang": Value("string"), "text": Value("string")})
 
-samples = []
 counts = defaultdict(int)
 rejected = []  # unsupported language codes or load failures
+
+
+def flush_shard():
+    global shard_idx, buffer
+    if not buffer:
+        return
+    ds_shard = Dataset.from_list(buffer, features=features)
+    shard_path = out_dir / "parts" / f"part-{shard_idx:05d}.parquet"
+    ds_shard.to_parquet(str(shard_path))
+    shard_idx += 1
+    buffer = []
+
 
 for lang in LANGS:
     print(f"\n=== {lang} ===")
@@ -68,22 +86,22 @@ for lang in LANGS:
             continue
 
         text = text[:MAX_CHARS]
-        samples.append({"lang": lang, "text": text})
+        buffer.append({"lang": lang, "text": text})
         counts[lang] += 1
         since_last_add = 0
-
+        if len(buffer) >= SHARD_ROWS:
+            flush_shard()
     print(f"Collected {counts[lang]} / {TARGET_PER_LANG} (scanned {scanned})")
-
+flush_shard()
 print("\nCounts summary:", dict(counts))
-print("Total samples:", len(samples))
+print("Total samples:", sum(counts.values()))
 
-out_dir = DATA_DIR / build_cfg["output_dir"]
-out_dir.mkdir(parents=True, exist_ok=True)
 
-if len(samples) == 0:
+if sum(counts.values()) == 0:
     raise RuntimeError("Collected 0 samples total — check dataset access/fields.")
 
-ds_out = Dataset.from_list(samples, features=features)
+parquet_files = sorted(str(p) for p in (out_dir / "parts").glob("part-*.parquet"))
+ds_out = load_dataset("parquet", data_files=parquet_files)
 ds_out.save_to_disk(str(out_dir))
 
 pd.DataFrame([{"lang": lang, "count": counts[lang]} for lang in LANGS]).to_csv(

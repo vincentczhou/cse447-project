@@ -16,6 +16,8 @@ dev = [
     "datasets==3.6.0",
     "pre-commit>=4.5.1",
     "ruff>=0.14.14",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
 ]
 
 [tool.uv.sources]

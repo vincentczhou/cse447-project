@@ -7,6 +7,7 @@ builddataset:
   max_chars: 4000
   max_per_lang_scan: 200000
   patience_per_lang: 50000
+  shard_rows: 20000
   output_dir: madlad_multilang_clean_15k_optionB
   langs:
     - en
