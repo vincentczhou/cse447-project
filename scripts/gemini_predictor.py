@@ -37,7 +37,7 @@ from tqdm.asyncio import tqdm
 # ── Configuration ──────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 FALLBACK_PRED = " ea"
 CONTEXT_LIMIT = 200
 DEFAULT_CONCURRENCY = 20
@@ -228,7 +228,7 @@ def main():
     print(f"Inputs: {len(inputs)}\n")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as out_f:
+    with open(args.output, "w", encoding="utf-8", buffering=1) as out_f:
         preds, elapsed = asyncio.run(
             predict_all(client, inputs, args.concurrency, out_f)
         )
