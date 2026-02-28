@@ -37,25 +37,25 @@ from tqdm.asyncio import tqdm
 # ── Configuration ──────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-MODEL_NAME = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-2.5-flash"
 FALLBACK_PRED = " ea"
 CONTEXT_LIMIT = 200
 DEFAULT_CONCURRENCY = 20
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 5  # seconds; doubles each attempt + jitter
 REQUEST_TIMEOUT = 30  # seconds per attempt before retrying
+SYSTEM_PROMPT_REPEATS = 3
 
-SYSTEM_PROMPT = (
-    "You are a character-level language model assisting with next-character prediction.\n"
-    "You will be given a partial string from a dialogue utterance. "
-    "The input may be in English or another language, or a mix of both.\n"
-    "Your task is to predict the three most likely next characters "
-    "(letters, digits, spaces, punctuation, etc.) in order of probability.\n"
-    "Scoring is caseless, so prefer the lowercase form of a letter when unsure of case.\n"
-    "Return a JSON object with exactly three keys: 'first', 'second', 'third'.\n"
-    "Each value must be exactly one character. "
-    "Use a literal space character when space is your guess.\n"
-)
+SYSTEM_PROMPT = """
+    You are a character-level language model assisting with next-character prediction.
+    You will be given a partial string from a dialogue utterance.
+    The input may be in English or another language, or a mix of both.
+    Your task is to predict the three most likely next characters (letters, digits, spaces, punctuation, etc.) in order of probability.
+    Scoring is caseless, so prefer the lowercase form of a letter when unsure of case.
+    Return a JSON object with exactly three keys: 'first', 'second', 'third'.
+    Each value must be exactly one character. 
+    Use a literal space character when space is your guess.
+    """
 
 
 class CharPrediction(BaseModel):
@@ -120,25 +120,35 @@ async def predict_single(
 
 
 async def predict_all(
-    client: genai.Client, inputs: list[str], concurrency: int
+    client: genai.Client, inputs: list[str], concurrency: int, out_f
 ) -> tuple[list[str], float]:
     print(f"  {len(inputs)} inputs (concurrency={concurrency})")
 
     semaphore = asyncio.Semaphore(concurrency)
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=SYSTEM_PROMPT * SYSTEM_PROMPT_REPEATS,
         temperature=0.0,
         max_output_tokens=2048,
-        # thinking_config=types.ThinkingConfig(thinking_budget=0),
+        # Gemini 2.5
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        # Gemini 3
         # thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         response_mime_type="application/json",
         response_schema=CharPrediction,
     )
 
     wall_start = time.perf_counter()
+    buffer: dict[int, str] = {}
+    next_idx = 0
 
     async def _run(idx: int, text: str) -> tuple[int, str, float]:
+        nonlocal next_idx
         pred, elapsed = await predict_single(client, text, semaphore, config)
+        buffer[idx] = pred
+        while next_idx in buffer:
+            out_f.write(buffer.pop(next_idx) + "\n")
+            next_idx += 1
+        out_f.flush()
         return idx, pred, elapsed
 
     tasks = [_run(i, t) for i, t in enumerate(inputs)]
@@ -217,11 +227,11 @@ def main():
     print(f"Model : {MODEL_NAME}")
     print(f"Inputs: {len(inputs)}\n")
 
-    preds, elapsed = asyncio.run(predict_all(client, inputs, args.concurrency))
-
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.writelines(p + "\n" for p in preds)
+    with open(args.output, "w", encoding="utf-8") as out_f:
+        preds, elapsed = asyncio.run(
+            predict_all(client, inputs, args.concurrency, out_f)
+        )
     print(f"\nPredictions written to {args.output}")
 
     avg_ms = elapsed / len(inputs) * 1000 if inputs else 0
