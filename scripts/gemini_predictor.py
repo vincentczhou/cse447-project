@@ -4,25 +4,35 @@ Gemini API character-level next-character predictor (async version).
 
 Given partial text strings (one per line), predicts the three most likely
 next characters using the Gemini API with structured JSON output (Pydantic).
-Uses asyncio + a semaphore for bounded concurrency, exponential-backoff
-retries for rate limits / transient errors, and a tqdm progress bar.
+
+Features:
+  - Bounded async concurrency via asyncio semaphore + tqdm progress bar
+  - Exponential-backoff retries with jitter for transient errors / timeouts
+  - Streaming writes: predictions are flushed to disk in order as they arrive
+  - Prediction cache (<output>.cache.json): skips API calls for seen inputs,
+    persisted every CACHE_SAVE_INTERVAL completions and on Ctrl+C
+  - --eval-only: grade an existing predictions file without re-running the API
+  - --sample N: randomly sample N inputs; saves the corresponding gold answers
+    to <output>_answers.txt for easy downstream grading
 
 Reads GEMINI_API_KEY / GOOGLE_API_KEY from environment or a .env file in
 the project root.
 
 Usage:
     python scripts/gemini_predictor.py \
-        --input      example/input.txt \
-        --output     output/gemini_pred.txt \
-        --answer     example/answer.txt   # optional – prints accuracy
-        --sample     100                  # optional – randomly sample N inputs
-        --concurrency 20                  # optional – max parallel requests
-        --verbose                         # optional – per-line grading output
+        --input       example/input.txt \
+        --output      output/gemini_pred.txt \
+        --answer      example/answer.txt   # optional – prints accuracy
+        --sample      100                  # optional – randomly sample N inputs
+        --concurrency 20                   # optional – max parallel requests
+        --verbose                          # optional – per-line grading output
+        --eval-only                        # optional – skip prediction, just grade
 """
 
 import argparse
 import asyncio
 from dotenv import load_dotenv
+import json
 import os
 from pathlib import Path
 import random
@@ -40,22 +50,23 @@ API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 MODEL_NAME = "gemini-3-flash-preview"
 FALLBACK_PRED = " ea"
 CONTEXT_LIMIT = 200
-DEFAULT_CONCURRENCY = 20
+DEFAULT_CONCURRENCY = 150
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 5  # seconds; doubles each attempt + jitter
 REQUEST_TIMEOUT = 30  # seconds per attempt before retrying
+SYSTEM_PROMPT_REPEATS = 3
+CACHE_SAVE_INTERVAL = 50  # persist cache to disk every N predictions
 
-SYSTEM_PROMPT = (
-    "You are a character-level language model assisting with next-character prediction.\n"
-    "You will be given a partial string from a dialogue utterance. "
-    "The input may be in English or another language, or a mix of both.\n"
-    "Your task is to predict the three most likely next characters "
-    "(letters, digits, spaces, punctuation, etc.) in order of probability.\n"
-    "Scoring is caseless, so prefer the lowercase form of a letter when unsure of case.\n"
-    "Return a JSON object with exactly three keys: 'first', 'second', 'third'.\n"
-    "Each value must be exactly one character. "
-    "Use a literal space character when space is your guess.\n"
-)
+SYSTEM_PROMPT = """
+    You are a character-level language model assisting with next-character prediction.
+    You will be given a partial string from a dialogue utterance.
+    The input may be in English or another language, or a mix of both.
+    Your task is to predict the three most likely next characters (letters, digits, spaces, punctuation, etc.) in order of probability.
+    Scoring is caseless, so prefer the lowercase form of a letter when unsure of case.
+    Return a JSON object with exactly three keys: 'first', 'second', 'third'.
+    Each value must be exactly one character. 
+    Use a literal space character ' ' when any whitespace (space, tab, newline, etc.) is your guess — never output a raw newline or tab.
+    """
 
 
 class CharPrediction(BaseModel):
@@ -70,7 +81,8 @@ class CharPrediction(BaseModel):
     @field_validator("first", "second", "third")
     @classmethod
     def single_char(cls, v: str) -> str:
-        return v[:1] or " "
+        c = v[:1]
+        return " " if not c or c.isspace() else c
 
     def to_pred(self) -> str:
         return self.first + self.second + self.third
@@ -86,7 +98,11 @@ async def predict_single(
     text: str,
     semaphore: asyncio.Semaphore,
     config: types.GenerateContentConfig,
+    cache: dict[str, str],
 ) -> tuple[str, float]:
+    if text in cache:
+        return cache[text], 0.0
+
     async with semaphore:
         t0 = time.perf_counter()
         result = FALLBACK_PRED
@@ -101,6 +117,7 @@ async def predict_single(
                     timeout=REQUEST_TIMEOUT,
                 )
                 result = CharPrediction.model_validate_json(resp.text or "").to_pred()
+                cache[text] = result
                 break
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
@@ -120,25 +137,45 @@ async def predict_single(
 
 
 async def predict_all(
-    client: genai.Client, inputs: list[str], concurrency: int
+    client: genai.Client,
+    inputs: list[str],
+    concurrency: int,
+    out_f,
+    cache: dict[str, str],
+    cache_path: Path,
 ) -> tuple[list[str], float]:
     print(f"  {len(inputs)} inputs (concurrency={concurrency})")
 
     semaphore = asyncio.Semaphore(concurrency)
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=SYSTEM_PROMPT * SYSTEM_PROMPT_REPEATS,
         temperature=0.0,
         max_output_tokens=2048,
+        # Gemini 2.5
         # thinking_config=types.ThinkingConfig(thinking_budget=0),
+        # Gemini 3
         # thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         response_mime_type="application/json",
         response_schema=CharPrediction,
     )
 
     wall_start = time.perf_counter()
+    buffer: dict[int, str] = {}
+    next_idx = 0
+    completed = 0
 
     async def _run(idx: int, text: str) -> tuple[int, str, float]:
-        pred, elapsed = await predict_single(client, text, semaphore, config)
+        nonlocal next_idx, completed
+        pred, elapsed = await predict_single(client, text, semaphore, config, cache)
+        pred = "".join(" " if c.isspace() else c for c in pred)
+        buffer[idx] = pred
+        while next_idx in buffer:
+            out_f.write(buffer.pop(next_idx) + "\n")
+            next_idx += 1
+        out_f.flush()
+        completed += 1
+        if completed % CACHE_SAVE_INTERVAL == 0:
+            save_cache(cache, cache_path)
         return idx, pred, elapsed
 
     tasks = [_run(i, t) for i, t in enumerate(inputs)]
@@ -151,6 +188,19 @@ async def predict_all(
 def load_lines(path: str) -> list[str]:
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
+
+
+def load_cache(path: Path) -> dict[str, str]:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cache(cache: dict[str, str], path: Path) -> None:
+    path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
 def grade(preds: list[str], golds: list[str], verbose: bool = False) -> float:
@@ -212,16 +262,34 @@ def main():
         inputs = [inputs[i] for i in indices]
         if golds:
             golds = [golds[i] for i in indices]
+            sampled_answer_path = Path(args.output).with_name(
+                Path(args.output).stem + "_answers.txt"
+            )
+            sampled_answer_path.parent.mkdir(parents=True, exist_ok=True)
+            sampled_answer_path.write_text("\n".join(golds) + "\n", encoding="utf-8")
+            print(f"Sampled answers written to {sampled_answer_path}")
         print(f"Sampled {args.sample}/{len(load_lines(args.input))} inputs (seed=42)")
 
     print(f"Model : {MODEL_NAME}")
     print(f"Inputs: {len(inputs)}\n")
 
-    preds, elapsed = asyncio.run(predict_all(client, inputs, args.concurrency))
+    cache_path = Path(args.output).with_suffix(".cache.json")
+    cache = load_cache(cache_path)
+    if cache:
+        print(f"Cache : {len(cache)} entries loaded from {cache_path}")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.writelines(p + "\n" for p in preds)
+    try:
+        with open(args.output, "w", encoding="utf-8", buffering=1) as out_f:
+            preds, elapsed = asyncio.run(
+                predict_all(client, inputs, args.concurrency, out_f, cache, cache_path)
+            )
+    except KeyboardInterrupt:
+        save_cache(cache, cache_path)
+        print(f"\nInterrupted. Cache saved to {cache_path}", file=sys.stderr)
+        sys.exit(0)
+
+    save_cache(cache, cache_path)
     print(f"\nPredictions written to {args.output}")
 
     avg_ms = elapsed / len(inputs) * 1000 if inputs else 0
