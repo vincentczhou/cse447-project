@@ -99,13 +99,14 @@ async def predict_single(
     semaphore: asyncio.Semaphore,
     config: types.GenerateContentConfig,
     cache: dict[str, str],
-) -> tuple[str, float]:
+) -> tuple[str, float, bool]:
     if text in cache:
-        return cache[text], 0.0
+        return cache[text], 0.0, False
 
     async with semaphore:
         t0 = time.perf_counter()
         result = FALLBACK_PRED
+        failed = True
         for attempt in range(MAX_RETRIES):
             try:
                 resp = await asyncio.wait_for(
@@ -118,6 +119,7 @@ async def predict_single(
                 )
                 result = CharPrediction.model_validate_json(resp.text or "").to_pred()
                 cache[text] = result
+                failed = False
                 break
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
@@ -133,7 +135,7 @@ async def predict_single(
                         file=sys.stderr,
                     )
         elapsed = time.perf_counter() - t0
-    return result, elapsed
+    return result, elapsed, failed
 
 
 async def predict_all(
@@ -163,10 +165,15 @@ async def predict_all(
     buffer: dict[int, str] = {}
     next_idx = 0
     completed = 0
+    failed = 0
 
     async def _run(idx: int, text: str) -> tuple[int, str, float]:
-        nonlocal next_idx, completed
-        pred, elapsed = await predict_single(client, text, semaphore, config, cache)
+        nonlocal next_idx, completed, failed
+        pred, elapsed, did_fail = await predict_single(
+            client, text, semaphore, config, cache
+        )
+        if did_fail:
+            failed += 1
         pred = "".join(" " if c.isspace() else c for c in pred)
         buffer[idx] = pred
         while next_idx in buffer:
@@ -182,7 +189,7 @@ async def predict_all(
     results = await tqdm.gather(*tasks, desc="Predicting", unit="input")
     wall_time = time.perf_counter() - wall_start
     preds = [r[1] for r in sorted(results)]
-    return preds, wall_time
+    return preds, wall_time, failed
 
 
 def load_lines(path: str) -> list[str]:
@@ -281,7 +288,7 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     try:
         with open(args.output, "w", encoding="utf-8", buffering=1) as out_f:
-            preds, elapsed = asyncio.run(
+            preds, elapsed, n_failed = asyncio.run(
                 predict_all(client, inputs, args.concurrency, out_f, cache, cache_path)
             )
     except KeyboardInterrupt:
@@ -296,6 +303,7 @@ def main():
     print(f"\n{'=' * 50}")
     print(f"  Model     : {MODEL_NAME}")
     print(f"  Inputs    : {len(inputs)}")
+    print(f"  Failed    : {n_failed}/{len(inputs)} (fallback used)")
     print(f"  Wall time : {elapsed:.2f}s")
     print(f"  Avg/input : {avg_ms:.1f}ms")
     if elapsed:
