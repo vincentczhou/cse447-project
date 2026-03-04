@@ -47,13 +47,15 @@ from tqdm.asyncio import tqdm
 # ── Configuration ──────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# MODEL_NAME = "gemini-2.5-pro"
 MODEL_NAME = "gemini-3-flash-preview"
+# MODEL_NAME = "gemini-3.1-pro-preview"
 FALLBACK_PRED = " ea"
 CONTEXT_LIMIT = 200
 DEFAULT_CONCURRENCY = 150
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 5  # seconds; doubles each attempt + jitter
-REQUEST_TIMEOUT = 30  # seconds per attempt before retrying
+REQUEST_TIMEOUT = 120  # seconds per attempt before retrying
 SYSTEM_PROMPT_REPEATS = 3
 CACHE_SAVE_INTERVAL = 50  # persist cache to disk every N predictions
 
@@ -151,8 +153,8 @@ async def predict_all(
     semaphore = asyncio.Semaphore(concurrency)
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT * SYSTEM_PROMPT_REPEATS,
-        temperature=0.0,
-        max_output_tokens=2048,
+        # temperature=0.0,
+        max_output_tokens=16384,
         # Gemini 2.5
         # thinking_config=types.ThinkingConfig(thinking_budget=0),
         # Gemini 3
