@@ -20,11 +20,14 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 import yaml
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -492,126 +495,109 @@ def collate_reranker(
 
 
 # ---------------------------------------------------------------------------
-# LR scheduler
+# Lightning module
 # ---------------------------------------------------------------------------
 
 
-def get_scheduler(
-    name: str,
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr_ratio: float = 0.1,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Create an LR scheduler with linear warmup then decay.
+class RerankerLightningModule(L.LightningModule):
+    """Wraps Reranker as a LightningModule.
 
-    Args:
-        name: "cosine" or "linear".
-        optimizer: the optimizer whose LR to schedule.
-        warmup_steps: number of steps for linear warmup (0 -> base LR).
-        total_steps: total training steps (warmup + decay).
-        min_lr_ratio: final LR = base_lr * min_lr_ratio.
-
-    Returns:
-        A LambdaLR scheduler (call .step() once per optimizer step).
+    Lightning handles AMP, gradient accumulation, gradient clipping,
+    checkpointing, early stopping, and wandb logging — all via Trainer flags
+    and callbacks. This class only needs to define the forward logic and
+    optimizer configuration.
     """
 
-    def lr_lambda(current_step: int) -> float:
-        # Phase 1: linear warmup
-        if current_step < warmup_steps:
-            return current_step / max(1, warmup_steps)
+    def __init__(
+        self,
+        model_cfg_dict: dict,
+        train_cfg_dict: dict,
+        tokens: list[str],
+        unigram_probs: torch.Tensor,
+    ):
+        super().__init__()
+        # save_hyperparameters embeds model_cfg_dict, train_cfg_dict, and tokens
+        # into the Lightning checkpoint so load_from_checkpoint works with no args.
+        self.save_hyperparameters(ignore=["unigram_probs"])
+        self.model_cfg = RerankerConfig(**model_cfg_dict)
+        self.train_cfg = TrainConfig(**train_cfg_dict)
+        self.model = Reranker(self.model_cfg)
+        self.tokens = tokens
+        # register_buffer saves unigram_probs with the checkpoint without
+        # treating it as a trainable parameter.
+        self.register_buffer("unigram_probs", unigram_probs)
 
-        # Phase 2: decay from 1.0 down to min_lr_ratio
-        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-        progress = min(progress, 1.0)
+    def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
+        context_ids, candidate_ids, labels = batch
+        logits = self.model.score_candidates(context_ids, candidate_ids)
+        loss = F.cross_entropy(logits, labels)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
 
-        if name == "cosine":
-            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        elif name == "linear":
-            decay = 1.0 - progress
-        else:
-            raise ValueError(f"Unknown scheduler: {name!r}. Use 'cosine' or 'linear'.")
+    def validation_step(self, batch: tuple, batch_idx: int) -> None:
+        context_ids, candidate_ids, labels = batch
+        logits = self.model.score_candidates(context_ids, candidate_ids)
+        loss = F.cross_entropy(logits, labels)
+        top1 = (logits.argmax(dim=1) == labels).float().mean()
+        k = min(3, logits.size(1))
+        top3 = (
+            (logits.topk(k, dim=1).indices == labels.unsqueeze(1))
+            .any(dim=1)
+            .float()
+            .mean()
+        )
+        self.log_dict(
+            {"valid/loss": loss, "valid/top1": top1, "valid/top3": top3},
+            on_epoch=True,
+            prog_bar=True,
+        )
 
-        # Scale decay so it goes from 1.0 -> min_lr_ratio (not 1.0 -> 0.0)
-        return min_lr_ratio + (1.0 - min_lr_ratio) * decay
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.train_cfg.lr,
+            weight_decay=self.train_cfg.weight_decay,
+        )
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Compute total steps for scheduler (trainer.estimated_stepping_batches
+        # accounts for grad accumulation and epochs automatically).
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = self.train_cfg.warmup_steps
+        min_lr_ratio = self.train_cfg.min_lr_ratio
+        scheduler_name = self.train_cfg.lr_scheduler
+
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            progress = (current_step - warmup_steps) / max(
+                1, total_steps - warmup_steps
+            )
+            progress = min(progress, 1.0)
+            if scheduler_name == "cosine":
+                decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            else:  # linear
+                decay = 1.0 - progress
+            return min_lr_ratio + (1.0 - min_lr_ratio) * decay
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint I/O
+# Inference loading  (Lightning-free — no Lightning needed at inference time)
 # ---------------------------------------------------------------------------
-
-
-def save_checkpoint(
-    path: Path,
-    model: Reranker,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    scaler: torch.amp.GradScaler | None,
-    epoch: int,
-    best_metric: float,
-    global_step: int,
-    model_config: RerankerConfig,
-    tokens: list[str],
-) -> None:
-    """Save a full checkpoint (training resume + inference loading).
-
-    The checkpoint contains two groups of data:
-        Inference-ready: model_state_dict, tokens, config (as dict)
-        Resume-only:     optimizer, scheduler, scaler, epoch, best_metric, global_step
-    """
-    ckpt = {
-        # Inference-ready fields (used by myprogram.py later)
-        "model_state_dict": model.state_dict(),
-        "tokens": tokens,
-        "config": dataclasses.asdict(model_config),
-        # Training resume fields
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-        "epoch": epoch,
-        "best_metric": best_metric,
-        "global_step": global_step,
-    }
-    torch.save(ckpt, path)
-
-
-def load_checkpoint(
-    path: Path,
-    model: Reranker,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    scaler: torch.amp.GradScaler | None,
-    device: torch.device,
-) -> tuple[int, float, int]:
-    """Load a checkpoint for training resumption.
-
-    Args:
-        path: path to the checkpoint file.
-        model, optimizer, scheduler, scaler: objects to load state into.
-        device: device to map tensors to.
-
-    Returns:
-        (next_epoch, best_metric, global_step) so the training loop can
-        continue from where it left off.
-    """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    if scaler is not None and ckpt.get("scaler_state_dict") is not None:
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return ckpt["epoch"] + 1, ckpt["best_metric"], ckpt["global_step"]
 
 
 def load_for_inference(
     path: Path, device: torch.device
 ) -> tuple[Reranker, list[str], dict[str, int]]:
-    """Load a checkpoint for inference (no optimizer/scheduler needed).
+    """Load a plain inference checkpoint (saved by main() after training).
 
-    Reconstructs the model from the saved config, loads weights, and
-    returns everything needed to call model.score_candidates().
+    The inference checkpoint is a plain PyTorch file — no Lightning required.
+    It contains: model_state_dict, tokens, config (as dict).
 
     Returns:
         model: Reranker in eval mode on the given device.
@@ -632,96 +618,18 @@ def load_for_inference(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Entry point
 # ---------------------------------------------------------------------------
 
 
-@torch.no_grad()
-def evaluate(
-    model: Reranker,
-    loader: torch.utils.data.DataLoader,
-    device: torch.device,
-    autocast_ctx,
-    max_batches: int | None = None,
-) -> dict[str, float]:
-    """Evaluate the model on a validation DataLoader.
+def main() -> None:
+    """Load config from config.yaml and run training. No CLI arguments."""
+    model_cfg, train_cfg = _load_config_from_yaml()
 
-    Args:
-        model: the Reranker (will be set to eval mode, then restored).
-        loader: DataLoader yielding (context_ids, candidate_ids, labels).
-        device: device tensors should be on.
-        autocast_ctx: torch.amp.autocast context (or nullcontext).
-        max_batches: cap on number of batches to evaluate (None = all).
+    # ---- Seed ----
+    L.seed_everything(train_cfg.seed)
 
-    Returns:
-        Dict with keys: "loss", "top1_acc", "top3_acc".
-    """
-    was_training = model.training
-    model.eval()
-
-    total_loss = 0.0
-    total_top1 = 0
-    total_top3 = 0
-    total_examples = 0
-
-    for batch_idx, (context_ids, candidate_ids, labels) in enumerate(loader):
-        if max_batches is not None and batch_idx >= max_batches:
-            break
-
-        context_ids = context_ids.to(device)
-        candidate_ids = candidate_ids.to(device)
-        labels = labels.to(device)
-
-        with autocast_ctx:
-            logits = model.score_candidates(context_ids, candidate_ids)  # [B, M]
-            loss = F.cross_entropy(logits, labels)
-
-        B = labels.size(0)
-        total_loss += loss.item() * B
-        total_examples += B
-
-        # Top-1: is the highest-scoring candidate the gold?
-        top1_preds = logits.argmax(dim=1)  # [B]
-        total_top1 += (top1_preds == labels).sum().item()
-
-        # Top-3: is gold among the 3 highest-scoring candidates?
-        top3_preds = logits.topk(min(3, logits.size(1)), dim=1).indices  # [B, 3]
-        total_top3 += (top3_preds == labels.unsqueeze(1)).any(dim=1).sum().item()
-
-    if was_training:
-        model.train()
-
-    if total_examples == 0:
-        return {"loss": 0.0, "top1_acc": 0.0, "top3_acc": 0.0}
-
-    return {
-        "loss": total_loss / total_examples,
-        "top1_acc": total_top1 / total_examples,
-        "top3_acc": total_top3 / total_examples,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-
-def train(model_cfg: RerankerConfig, train_cfg: TrainConfig) -> None:
-    """Full training loop: data -> model -> train -> evaluate -> checkpoint."""
-
-    # ---- Seed & device ----
-    random.seed(train_cfg.seed)
-    torch.manual_seed(train_cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(train_cfg.seed)
-
-    if train_cfg.cpu or not torch.cuda.is_available():
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda")
-    print(f"Device: {device}")
-
-    # ---- Load vocab & data ----
+    # ---- Vocab & sequences ----
     tokens, unigram_probs = load_vocab(Path(train_cfg.vocab_path))
     model_cfg.vocab_size = len(tokens)
     stoi = {tok: i for i, tok in enumerate(tokens)}
@@ -750,13 +658,14 @@ def train(model_cfg: RerankerConfig, train_cfg: TrainConfig) -> None:
         unigram_probs=unigram_probs,
         pad_id=model_cfg.pad_id,
     )
+    use_gpu = not train_cfg.cpu and torch.cuda.is_available()
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=train_cfg.batch_size,
         shuffle=True,
         num_workers=train_cfg.num_workers,
         collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=use_gpu,
         drop_last=True,
     )
     valid_loader = torch.utils.data.DataLoader(
@@ -765,249 +674,79 @@ def train(model_cfg: RerankerConfig, train_cfg: TrainConfig) -> None:
         shuffle=False,
         num_workers=train_cfg.num_workers,
         collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=use_gpu,
     )
 
-    # ---- Model, optimizer, scheduler, scaler ----
-    model = Reranker(model_cfg).to(device)
-    param_count = sum(p.numel() for p in model.parameters())
+    # ---- Lightning module ----
+    lit_model = RerankerLightningModule(
+        dataclasses.asdict(model_cfg),
+        dataclasses.asdict(train_cfg),
+        tokens,
+        unigram_probs,
+    )
+    param_count = sum(p.numel() for p in lit_model.model.parameters())
     print(f"Model parameters: {param_count:,}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
-    )
-
-    steps_per_epoch = len(train_loader) // train_cfg.gradient_accumulation_steps
-    total_steps = steps_per_epoch * train_cfg.epochs
-    scheduler = get_scheduler(
-        train_cfg.lr_scheduler,
-        optimizer,
-        train_cfg.warmup_steps,
-        total_steps,
-        train_cfg.min_lr_ratio,
-    )
-
-    use_amp = train_cfg.mixed_precision and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-    autocast_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.float16)
-        if use_amp
-        else torch.amp.autocast("cpu", enabled=False)
-    )
-
-    # ---- Output directory ----
+    # ---- Callbacks ----
     out_dir = Path(train_cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / train_cfg.checkpoint_name
-    best_ckpt_path = out_dir / f"best_{train_cfg.checkpoint_name}"
 
-    # ---- Resume from checkpoint ----
-    start_epoch = 0
-    best_metric = -float("inf") if "top" in train_cfg.metric else float("inf")
-    global_step = 0
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=out_dir,
+            filename="best_reranker",
+            monitor="valid/top3",
+            mode="max",
+            save_top_k=1,
+        ),
+        EarlyStopping(
+            monitor="valid/top3",
+            patience=train_cfg.patience,
+            mode="max",
+        ),
+    ]
 
-    if train_cfg.resume_from is not None:
-        resume_path = Path(train_cfg.resume_from)
-        print(f"Resuming from {resume_path}")
-        start_epoch, best_metric, global_step = load_checkpoint(
-            resume_path, model, optimizer, scheduler, scaler, device
-        )
-        print(
-            f"  Resumed at epoch {start_epoch}, step {global_step}, best_metric={best_metric:.4f}"
-        )
-
-    # ---- Wandb ----
+    # ---- Logger ----
     if train_cfg.wandb_project:
         try:
-            import wandb
-
-            wandb.init(
+            logger = WandbLogger(
                 project=train_cfg.wandb_project,
                 entity=train_cfg.wandb_entity,
                 name=train_cfg.wandb_run_name,
-                config={
-                    "model": dataclasses.asdict(model_cfg),
-                    "training": dataclasses.asdict(train_cfg),
-                },
             )
-        except ImportError:
-            print("wandb not installed, skipping logging")
-            train_cfg.wandb_project = None
+        except Exception:
+            print("wandb unavailable, disabling logger")
+            logger = True
+    else:
+        logger = True  # Lightning's default CSV logger
 
-    higher_is_better = "top" in train_cfg.metric
-    patience_counter = 0
+    # ---- Trainer ----
+    trainer = L.Trainer(
+        max_epochs=train_cfg.epochs,
+        precision="16-mixed" if (train_cfg.mixed_precision and use_gpu) else 32,
+        accumulate_grad_batches=train_cfg.gradient_accumulation_steps,
+        gradient_clip_val=train_cfg.grad_clip,
+        callbacks=callbacks,
+        logger=logger,
+        log_every_n_steps=train_cfg.log_every,
+        default_root_dir=str(out_dir),
+        accelerator="gpu" if use_gpu else "cpu",
+        limit_val_batches=train_cfg.max_eval_batches or 1.0,
+    )
 
-    # ---- Training loop ----
-    for epoch in range(start_epoch, train_cfg.epochs):
-        model.train()
-        epoch_loss = 0.0
-        epoch_batches = 0
+    trainer.fit(lit_model, train_loader, valid_loader, ckpt_path=train_cfg.resume_from)
 
-        for batch_idx, (context_ids, candidate_ids, labels) in enumerate(train_loader):
-            context_ids = context_ids.to(device)
-            candidate_ids = candidate_ids.to(device)
-            labels = labels.to(device)
-
-            with autocast_ctx:
-                logits = model.score_candidates(context_ids, candidate_ids)
-                loss = F.cross_entropy(logits, labels)
-                loss = loss / train_cfg.gradient_accumulation_steps
-
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            epoch_loss += loss.item() * train_cfg.gradient_accumulation_steps
-            epoch_batches += 1
-
-            # Optimizer step every gradient_accumulation_steps
-            is_accum_step = (batch_idx + 1) % train_cfg.gradient_accumulation_steps == 0
-            is_last_batch = batch_idx == len(train_loader) - 1
-            if is_accum_step or is_last_batch:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), train_cfg.grad_clip
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), train_cfg.grad_clip
-                    )
-                    optimizer.step()
-
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-
-                # Periodic logging
-                if global_step % train_cfg.log_every == 0:
-                    avg_loss = epoch_loss / epoch_batches
-                    lr = optimizer.param_groups[0]["lr"]
-                    print(
-                        f"  epoch {epoch + 1}/{train_cfg.epochs}  "
-                        f"step {global_step}  "
-                        f"loss {avg_loss:.4f}  "
-                        f"lr {lr:.2e}"
-                    )
-                    if train_cfg.wandb_project:
-                        import wandb
-
-                        wandb.log(
-                            {
-                                "train/loss": avg_loss,
-                                "train/lr": lr,
-                                "global_step": global_step,
-                            },
-                            step=global_step,
-                        )
-
-        # ---- End-of-epoch evaluation ----
-        avg_train_loss = epoch_loss / max(1, epoch_batches)
-        val_metrics = evaluate(
-            model, valid_loader, device, autocast_ctx, train_cfg.max_eval_batches
-        )
-
-        print(
-            f"Epoch {epoch + 1}/{train_cfg.epochs}  "
-            f"train_loss={avg_train_loss:.4f}  "
-            f"valid_loss={val_metrics['loss']:.4f}  "
-            f"valid_top1={val_metrics['top1_acc']:.4f}  "
-            f"valid_top3={val_metrics['top3_acc']:.4f}"
-        )
-
-        if train_cfg.wandb_project:
-            import wandb
-
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "train/epoch_loss": avg_train_loss,
-                    "valid/loss": val_metrics["loss"],
-                    "valid/top1_acc": val_metrics["top1_acc"],
-                    "valid/top3_acc": val_metrics["top3_acc"],
-                },
-                step=global_step,
-            )
-
-        # ---- Best model tracking & early stopping ----
-        if train_cfg.metric == "valid_top3":
-            current_metric = val_metrics["top3_acc"]
-        elif train_cfg.metric == "valid_loss":
-            current_metric = val_metrics["loss"]
-        else:
-            current_metric = val_metrics.get(train_cfg.metric, val_metrics["top3_acc"])
-
-        improved = (
-            current_metric > best_metric
-            if higher_is_better
-            else current_metric < best_metric
-        )
-
-        if improved:
-            best_metric = current_metric
-            patience_counter = 0
-            save_checkpoint(
-                best_ckpt_path,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                best_metric,
-                global_step,
-                model_cfg,
-                tokens,
-            )
-            print(
-                f"  -> New best {train_cfg.metric}={best_metric:.4f}, saved to {best_ckpt_path}"
-            )
-        else:
-            patience_counter += 1
-            print(f"  -> No improvement ({patience_counter}/{train_cfg.patience})")
-
-        # Save latest checkpoint every epoch
-        save_checkpoint(
-            ckpt_path,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            best_metric,
-            global_step,
-            model_cfg,
-            tokens,
-        )
-
-        if patience_counter >= train_cfg.patience:
-            print(
-                f"Early stopping after {epoch + 1} epochs (no improvement for {train_cfg.patience} epochs)"
-            )
-            break
-
-    # ---- Cleanup ----
-    if train_cfg.wandb_project:
-        import wandb
-
-        wandb.finish()
-
-    print(f"Training complete. Best {train_cfg.metric}={best_metric:.4f}")
-    print(f"Best checkpoint: {best_ckpt_path}")
-    print(f"Latest checkpoint: {ckpt_path}")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    """Load config from config.yaml and run training. No CLI arguments."""
-    model_cfg, train_cfg = _load_config_from_yaml()
-    train(model_cfg, train_cfg)
+    # ---- Export plain inference checkpoint (no Lightning needed at runtime) ----
+    inference_path = out_dir / train_cfg.checkpoint_name
+    torch.save(
+        {
+            "model_state_dict": lit_model.model.state_dict(),
+            "tokens": tokens,
+            "config": dataclasses.asdict(model_cfg),
+        },
+        inference_path,
+    )
+    print(f"Inference checkpoint saved to {inference_path}")
 
 
 if __name__ == "__main__":
