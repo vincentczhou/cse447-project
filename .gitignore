@@ -8,3 +8,4 @@ submit.zip
 /data/
 .env
 wandb/
+*.zip
