@@ -12,7 +12,7 @@ prediction:
   fallback: " ea"              # Default prediction when errors occur (most common chars)
 
 workers:
-  max_workers: 8               # Maximum number of parallel workers
+  max_workers: 24               # Maximum number of parallel workers
   sequential_threshold: 100    # Use sequential mode below this many inputs
   chunk_divisor: 4             # chunksize = len(data) // (num_workers * chunk_divisor)
 
@@ -20,7 +20,7 @@ wandb:
   enabled: true
   project: cse447
   entity: vincentczhou-university-of-washington
-  run_name: test_overfit_noNgram _1024_batch              # Custom wandb run name (null = auto-generated)
+  run_name: small_test_overfit_noNgram_512_batch              # Custom wandb run name (null = auto-generated)
   silent: true                 # Suppress wandb console output
 
 # ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ reranker:
     grad_clip: 1.0             # Gradient norm clipping
     warmup_steps: 500          # Linear warmup steps before decay
     gradient_accumulation_steps: 1
-    mixed_precision: false      # AMP (only active on CUDA)
+    mixed_precision: true      # AMP (only active on CUDA)
     cpu: false                 # Force CPU even if GPU is available
     lr_scheduler: cosine       # "cosine" or "linear" (with warmup)
     min_lr_ratio: 0.1          # Final LR = lr * min_lr_ratio
@@ -69,9 +69,9 @@ reranker:
   # --- Data limits (for quick iteration / memory control, null = no limit) ---
   data_limits:
     # max_train_lines: null
-    max_train_lines: 100
+    max_train_lines: 10
     # max_valid_lines: null
-    max_valid_lines: 20
+    max_valid_lines: 5
     max_train_examples: null
     max_valid_examples: 50000
     max_eval_batches: 200
@@ -84,5 +84,5 @@ reranker:
 
   # --- Logging ---
   logging:
-    log_every: 100             # Print training loss every N optimizer steps
-    num_workers: 2             # DataLoader workers
+    log_every: 10              # Print training loss every N optimizer steps
+    num_workers: 8             # DataLoader workers
