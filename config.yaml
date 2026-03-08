@@ -20,6 +20,7 @@ wandb:
   enabled: true
   project: cse447
   entity: vincentczhou-university-of-washington
+  run_name: test_overfit_noNgram _1024_batch              # Custom wandb run name (null = auto-generated)
   silent: true                 # Suppress wandb console output
 
 # ---------------------------------------------------------------------------
@@ -33,29 +34,30 @@ reranker:
     num_layers: 4              # Number of Transformer encoder layers
     ff_mult: 4                 # Feed-forward hidden dim = d_model * ff_mult
     dropout: 0.1               # Dropout rate
-    max_context_len: 256       # Max prefix length the model can handle
+    max_context_len: 200       # Max prefix length the model can handle
     norm_first: true           # Pre-norm (true, modern/stable) vs post-norm (false)
     temperature: 1.0           # Initial logit temperature (learned during training)
 
   # --- Training hyperparameters ---
   training:
-    epochs: 10
-    batch_size: 64
-    eval_batch_size: 128
+    epochs: 20
+    batch_size: 512
+    eval_batch_size: 512
     candidate_size: 64         # Number of candidates per example (gold + negatives)
     lr: 3.0e-4                 # Learning rate (AdamW)
     weight_decay: 0.01
     grad_clip: 1.0             # Gradient norm clipping
     warmup_steps: 500          # Linear warmup steps before decay
     gradient_accumulation_steps: 1
-    mixed_precision: true      # AMP (only active on CUDA)
+    mixed_precision: false      # AMP (only active on CUDA)
+    cpu: false                 # Force CPU even if GPU is available
     lr_scheduler: cosine       # "cosine" or "linear" (with warmup)
     min_lr_ratio: 0.1          # Final LR = lr * min_lr_ratio
     seed: 42
 
   # --- Early stopping / best model ---
   early_stopping:
-    patience: 3                # Epochs without improvement before stopping
+    patience: 20                # Epochs without improvement before stopping
     metric: valid_top3         # "valid_top3" (higher=better) or "valid_loss" (lower=better)
 
   # --- Data paths (relative to repo root) ---
@@ -66,8 +68,10 @@ reranker:
 
   # --- Data limits (for quick iteration / memory control, null = no limit) ---
   data_limits:
-    max_train_lines: null
-    max_valid_lines: null
+    # max_train_lines: null
+    max_train_lines: 100
+    # max_valid_lines: null
+    max_valid_lines: 20
     max_train_examples: null
     max_valid_examples: 50000
     max_eval_batches: 200

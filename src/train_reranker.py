@@ -22,6 +22,7 @@ from pathlib import Path
 
 import lightning as L
 import torch
+from dotenv import load_dotenv
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
@@ -170,6 +171,7 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
             "gradient_accumulation_steps", train_cfg.gradient_accumulation_steps
         ),
         mixed_precision=tr.get("mixed_precision", train_cfg.mixed_precision),
+        cpu=tr.get("cpu", train_cfg.cpu),
         lr_scheduler=tr.get("lr_scheduler", train_cfg.lr_scheduler),
         min_lr_ratio=tr.get("min_lr_ratio", train_cfg.min_lr_ratio),
         seed=tr.get("seed", train_cfg.seed),
@@ -184,6 +186,7 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         if wandb_cfg.get("enabled", True)
         else None,
         wandb_entity=wandb_cfg.get("entity", train_cfg.wandb_entity),
+        wandb_run_name=wandb_cfg.get("run_name", train_cfg.wandb_run_name),
         log_every=log.get("log_every", train_cfg.log_every),
         num_workers=log.get("num_workers", train_cfg.num_workers),
     )
@@ -241,7 +244,9 @@ def load_sequences(
             if not line:
                 continue
             ids = [stoi.get(tok, UNK_ID) for tok in line.split()]
-            if len(ids) >= 2:
+            if (
+                len(ids) >= 2
+            ):  # need >=1 context token + 1 target token; single-token seqs yield no training examples
                 sequences.append(torch.tensor(ids, dtype=torch.long))
     return sequences
 
@@ -327,7 +332,12 @@ class Reranker(nn.Module):
         B, T = context_ids.shape
         device = context_ids.device
 
-        # Token + positional embeddings
+        # Token + positional embeddings.
+        # We use left-padding, so the last real token is always at index T-1,
+        # making context vector extraction simple (no variable-length indexing).
+        # Tradeoff: real tokens get absolute positions offset by padding length
+        # rather than starting from 0, but training and evaluation use the same
+        # convention so the model learns to compensate.
         positions = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
         x = self.token_emb(context_ids) + self.pos_emb(positions)  # [B, T, D]
         x = self.emb_drop(x)
@@ -352,11 +362,8 @@ class Reranker(nn.Module):
         )
         x = self.final_norm(x)  # [B, T, D]
 
-        # Extract the last non-pad position's hidden state for each example.
-        # lengths[b] = number of non-pad tokens in example b.
-        lengths = (context_ids != self.cfg.pad_id).sum(dim=1)  # [B]
-        last_idx = (lengths - 1).clamp(min=0)  # [B]
-        ctx_vec = x[torch.arange(B, device=device), last_idx]  # [B, D]
+        # With left-padding the last real token is always at position T-1.
+        ctx_vec = x[:, -1, :]  # [B, D]
         return ctx_vec
 
     def score_candidates(
@@ -553,6 +560,7 @@ class RerankerLightningModule(L.LightningModule):
         )
 
     def configure_optimizers(self):
+        # https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.core.LightningModule.html#lightning.pytorch.core.LightningModule.configure_optimizers
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.train_cfg.lr,
@@ -563,23 +571,26 @@ class RerankerLightningModule(L.LightningModule):
         # accounts for grad accumulation and epochs automatically).
         total_steps = self.trainer.estimated_stepping_batches
         warmup_steps = self.train_cfg.warmup_steps
-        min_lr_ratio = self.train_cfg.min_lr_ratio
-        scheduler_name = self.train_cfg.lr_scheduler
+        decay_steps = max(1, total_steps - warmup_steps)
+        min_lr = self.train_cfg.min_lr_ratio * self.train_cfg.lr
 
-        def lr_lambda(current_step: int) -> float:
-            if current_step < warmup_steps:
-                return current_step / max(1, warmup_steps)
-            progress = (current_step - warmup_steps) / max(
-                1, total_steps - warmup_steps
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+        if self.train_cfg.lr_scheduler == "cosine":
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=decay_steps, eta_min=min_lr
             )
-            progress = min(progress, 1.0)
-            if scheduler_name == "cosine":
-                decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            else:  # linear
-                decay = 1.0 - progress
-            return min_lr_ratio + (1.0 - min_lr_ratio) * decay
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        else:  # linear
+            decay = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=self.train_cfg.min_lr_ratio,
+                total_iters=decay_steps,
+            )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
+        )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
@@ -624,6 +635,7 @@ def load_for_inference(
 
 def main() -> None:
     """Load config from config.yaml and run training. No CLI arguments."""
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     model_cfg, train_cfg = _load_config_from_yaml()
 
     # ---- Seed ----
@@ -731,6 +743,8 @@ def main() -> None:
         log_every_n_steps=train_cfg.log_every,
         default_root_dir=str(out_dir),
         accelerator="gpu" if use_gpu else "cpu",
+        devices="auto",
+        strategy="ddp",
         limit_val_batches=train_cfg.max_eval_batches or 1.0,
     )
 
