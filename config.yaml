@@ -21,3 +21,64 @@ wandb:
   project: cse447
   entity: vincentczhou-university-of-washington
   silent: true                 # Suppress wandb console output
+
+# ---------------------------------------------------------------------------
+# Reranker training configuration (used by src/train_reranker.py)
+# ---------------------------------------------------------------------------
+reranker:
+  # --- Model architecture (saved with checkpoint for inference loading) ---
+  architecture:
+    d_model: 256               # Embedding / hidden dimension
+    nhead: 8                   # Number of attention heads (d_model must be divisible by this)
+    num_layers: 4              # Number of Transformer encoder layers
+    ff_mult: 4                 # Feed-forward hidden dim = d_model * ff_mult
+    dropout: 0.1               # Dropout rate
+    max_context_len: 256       # Max prefix length the model can handle
+    norm_first: true           # Pre-norm (true, modern/stable) vs post-norm (false)
+    temperature: 1.0           # Initial logit temperature (learned during training)
+
+  # --- Training hyperparameters ---
+  training:
+    epochs: 10
+    batch_size: 64
+    eval_batch_size: 128
+    candidate_size: 64         # Number of candidates per example (gold + negatives)
+    lr: 3.0e-4                 # Learning rate (AdamW)
+    weight_decay: 0.01
+    grad_clip: 1.0             # Gradient norm clipping
+    warmup_steps: 500          # Linear warmup steps before decay
+    gradient_accumulation_steps: 1
+    mixed_precision: true      # AMP (only active on CUDA)
+    lr_scheduler: cosine       # "cosine" or "linear" (with warmup)
+    min_lr_ratio: 0.1          # Final LR = lr * min_lr_ratio
+    seed: 42
+
+  # --- Early stopping / best model ---
+  early_stopping:
+    patience: 3                # Epochs without improvement before stopping
+    metric: valid_top3         # "valid_top3" (higher=better) or "valid_loss" (lower=better)
+
+  # --- Data paths (relative to repo root) ---
+  data:
+    train_path: data/madlad_multilang_clean_15k_optionB_kenlm/train.txt
+    valid_path: data/madlad_multilang_clean_15k_optionB_kenlm/valid.txt
+    vocab_path: data/madlad_multilang_clean_15k_optionB_kenlm/vocab.json
+
+  # --- Data limits (for quick iteration / memory control, null = no limit) ---
+  data_limits:
+    max_train_lines: null
+    max_valid_lines: null
+    max_train_examples: null
+    max_valid_examples: 50000
+    max_eval_batches: 200
+
+  # --- Output ---
+  output:
+    out_dir: work
+    checkpoint_name: reranker.pt
+    resume_from: null          # Path to checkpoint for training resumption
+
+  # --- Logging ---
+  logging:
+    log_every: 100             # Print training loss every N optimizer steps
+    num_workers: 2             # DataLoader workers
