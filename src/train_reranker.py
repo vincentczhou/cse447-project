@@ -525,10 +525,10 @@ class RerankerLightningModule(L.LightningModule):
         super().__init__()
         # save_hyperparameters embeds model_cfg_dict, train_cfg_dict, and tokens
         # into the Lightning checkpoint so load_from_checkpoint works with no args.
-        self.save_hyperparameters(ignore=["unigram_probs"])
+        self.save_hyperparameters(ignore=["unigram_probs", "tokens"])
         self.model_cfg = RerankerConfig(**model_cfg_dict)
         self.train_cfg = TrainConfig(**train_cfg_dict)
-        self.model = Reranker(self.model_cfg)
+        self.model = torch.compile(Reranker(self.model_cfg))
         self.tokens = tokens
         # register_buffer saves unigram_probs with the checkpoint without
         # treating it as a trainable parameter.
@@ -538,7 +538,14 @@ class RerankerLightningModule(L.LightningModule):
         context_ids, candidate_ids, labels = batch
         logits = self.model.score_candidates(context_ids, candidate_ids)
         loss = F.cross_entropy(logits, labels)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
         return loss
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
@@ -557,6 +564,7 @@ class RerankerLightningModule(L.LightningModule):
             {"valid/loss": loss, "valid/top1": top1, "valid/top3": top3},
             on_epoch=True,
             prog_bar=True,
+            sync_dist=True,
         )
 
     def configure_optimizers(self):
