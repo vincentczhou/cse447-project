@@ -1,0 +1,323 @@
+#!/usr/bin/env python
+"""
+Gemini API character-level next-character predictor (async version).
+
+Given partial text strings (one per line), predicts the three most likely
+next characters using the Gemini API with structured JSON output (Pydantic).
+
+Features:
+  - Bounded async concurrency via asyncio semaphore + tqdm progress bar
+  - Exponential-backoff retries with jitter for transient errors / timeouts
+  - Streaming writes: predictions are flushed to disk in order as they arrive
+  - Prediction cache (<output>.cache.json): skips API calls for seen inputs,
+    persisted every CACHE_SAVE_INTERVAL completions and on Ctrl+C
+  - --eval-only: grade an existing predictions file without re-running the API
+  - --sample N: randomly sample N inputs; saves the corresponding gold answers
+    to <output>_answers.txt for easy downstream grading
+
+Reads GEMINI_API_KEY / GOOGLE_API_KEY from environment or a .env file in
+the project root.
+
+Usage:
+    python scripts/gemini_predictor.py \
+        --input       example/input.txt \
+        --output      output/gemini_pred.txt \
+        --answer      example/answer.txt   # optional – prints accuracy
+        --sample      100                  # optional – randomly sample N inputs
+        --concurrency 20                   # optional – max parallel requests
+        --verbose                          # optional – per-line grading output
+        --eval-only                        # optional – skip prediction, just grade
+"""
+
+import argparse
+import asyncio
+from dotenv import load_dotenv
+import json
+import os
+from pathlib import Path
+import random
+import sys
+import time
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field, field_validator
+from tqdm.asyncio import tqdm
+
+# ── Configuration ──────────────────────────────────────────────────────────
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = "gemini-3-flash-preview"
+# MODEL_NAME = "gemini-3.1-pro-preview"
+FALLBACK_PRED = " ea"
+CONTEXT_LIMIT = 200
+DEFAULT_CONCURRENCY = 150
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 5  # seconds; doubles each attempt + jitter
+REQUEST_TIMEOUT = 120  # seconds per attempt before retrying
+SYSTEM_PROMPT_REPEATS = 3
+CACHE_SAVE_INTERVAL = 50  # persist cache to disk every N predictions
+
+SYSTEM_PROMPT = """
+    You are a character-level language model assisting with next-character prediction.
+    You will be given a partial string from a dialogue utterance.
+    The input may be in English or another language, or a mix of both.
+    Your task is to predict the three most likely next characters (letters, digits, spaces, punctuation, etc.) in order of probability.
+    Scoring is caseless, so prefer the lowercase form of a letter when unsure of case.
+    Return a JSON object with exactly three keys: 'first', 'second', 'third'.
+    Each value must be exactly one character. 
+    Use a literal space character ' ' when any whitespace (space, tab, newline, etc.) is your guess — never output a raw newline or tab.
+    """
+
+
+class CharPrediction(BaseModel):
+    first: str = Field(description="Most likely next character (exactly one character)")
+    second: str = Field(
+        description="Second most likely next character (exactly one character)"
+    )
+    third: str = Field(
+        description="Third most likely next character (exactly one character)"
+    )
+
+    @field_validator("first", "second", "third")
+    @classmethod
+    def single_char(cls, v: str) -> str:
+        c = v[:1]
+        return " " if not c or c.isspace() else c
+
+    def to_pred(self) -> str:
+        return self.first + self.second + self.third
+
+
+def build_prompt(text: str) -> str:
+    trimmed = text if len(text) <= CONTEXT_LIMIT else "…" + text[-CONTEXT_LIMIT:]
+    return f'Predict the next character for this partial text:\n"{trimmed}"'
+
+
+async def predict_single(
+    client: genai.Client,
+    text: str,
+    semaphore: asyncio.Semaphore,
+    config: types.GenerateContentConfig,
+    cache: dict[str, str],
+) -> tuple[str, float, bool]:
+    if text in cache:
+        return cache[text], 0.0, False
+
+    async with semaphore:
+        t0 = time.perf_counter()
+        result = FALLBACK_PRED
+        failed = True
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=MODEL_NAME,
+                        contents=build_prompt(text),
+                        config=config,
+                    ),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                result = CharPrediction.model_validate_json(resp.text or "").to_pred()
+                cache[text] = result
+                failed = False
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    print(
+                        f"  [retry {attempt + 1}/{MAX_RETRIES}] {e} — waiting {delay:.1f}s",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    print(
+                        f"  [error] giving up after {MAX_RETRIES} attempts: {e}",
+                        file=sys.stderr,
+                    )
+        elapsed = time.perf_counter() - t0
+    return result, elapsed, failed
+
+
+async def predict_all(
+    client: genai.Client,
+    inputs: list[str],
+    concurrency: int,
+    out_f,
+    cache: dict[str, str],
+    cache_path: Path,
+) -> tuple[list[str], float]:
+    print(f"  {len(inputs)} inputs (concurrency={concurrency})")
+
+    semaphore = asyncio.Semaphore(concurrency)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT * SYSTEM_PROMPT_REPEATS,
+        # temperature=0.0,
+        max_output_tokens=16384,
+        # Gemini 2.5
+        # thinking_config=types.ThinkingConfig(thinking_budget=0),
+        # Gemini 3
+        # thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+        response_mime_type="application/json",
+        response_schema=CharPrediction,
+    )
+
+    wall_start = time.perf_counter()
+    buffer: dict[int, str] = {}
+    next_idx = 0
+    completed = 0
+    failed = 0
+
+    async def _run(idx: int, text: str) -> tuple[int, str, float]:
+        nonlocal next_idx, completed, failed
+        pred, elapsed, did_fail = await predict_single(
+            client, text, semaphore, config, cache
+        )
+        if did_fail:
+            failed += 1
+        pred = "".join(" " if c.isspace() else c for c in pred)
+        buffer[idx] = pred
+        while next_idx in buffer:
+            out_f.write(buffer.pop(next_idx) + "\n")
+            next_idx += 1
+        out_f.flush()
+        completed += 1
+        if completed % CACHE_SAVE_INTERVAL == 0:
+            save_cache(cache, cache_path)
+        return idx, pred, elapsed
+
+    tasks = [_run(i, t) for i, t in enumerate(inputs)]
+    results = await tqdm.gather(*tasks, desc="Predicting", unit="input")
+    wall_time = time.perf_counter() - wall_start
+    preds = [r[1] for r in sorted(results)]
+    return preds, wall_time, failed
+
+
+def load_lines(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f]
+
+
+def load_cache(path: Path) -> dict[str, str]:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cache(cache: dict[str, str], path: Path) -> None:
+    path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+
+
+def grade(preds: list[str], golds: list[str], verbose: bool = False) -> float:
+    correct = 0
+    for i, (p, g) in enumerate(zip(preds, golds)):
+        hit = g.lower() in p[:3].lower()
+        correct += hit
+        if verbose:
+            print(f"  {'✓' if hit else '✗'} [{i}] gold='{g}' pred='{p}'")
+    return correct / len(golds) if golds else 0.0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Gemini character-level predictor")
+    parser.add_argument("--input", required=True, help="Path to input.txt")
+    parser.add_argument("--output", default="output/gemini_pred.txt")
+    parser.add_argument("--answer", default=None, help="Path to answer.txt (optional)")
+    parser.add_argument("--api-key", default=None, help="Gemini API key")
+    parser.add_argument(
+        "--sample", type=int, default=None, help="Randomly sample N inputs"
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Max parallel API requests (default: {DEFAULT_CONCURRENCY})",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip prediction; grade an existing --output file against --answer",
+    )
+    args = parser.parse_args()
+
+    if args.eval_only:
+        if not args.answer:
+            sys.exit("Error: --eval-only requires --answer")
+        preds = load_lines(args.output)
+        golds = load_lines(args.answer)
+        print(f"Evaluating {args.output} ({len(preds)} predictions)")
+        acc = grade(preds, golds, verbose=args.verbose)
+        print(
+            f"\n  Accuracy (gold in top-3): {acc:.2%} ({int(acc * len(golds))}/{len(golds)})"
+        )
+        return
+
+    key = args.api_key or API_KEY
+    if not key:
+        sys.exit("Error: set GEMINI_API_KEY or GOOGLE_API_KEY, or pass --api-key")
+
+    client = genai.Client(api_key=key)
+    inputs = load_lines(args.input)
+    golds = load_lines(args.answer) if args.answer else None
+
+    if args.sample and args.sample < len(inputs):
+        random.seed(42)
+        indices = sorted(random.sample(range(len(inputs)), args.sample))
+        inputs = [inputs[i] for i in indices]
+        if golds:
+            golds = [golds[i] for i in indices]
+            sampled_answer_path = Path(args.output).with_name(
+                Path(args.output).stem + "_answers.txt"
+            )
+            sampled_answer_path.parent.mkdir(parents=True, exist_ok=True)
+            sampled_answer_path.write_text("\n".join(golds) + "\n", encoding="utf-8")
+            print(f"Sampled answers written to {sampled_answer_path}")
+        print(f"Sampled {args.sample}/{len(load_lines(args.input))} inputs (seed=42)")
+
+    print(f"Model : {MODEL_NAME}")
+    print(f"Inputs: {len(inputs)}\n")
+
+    cache_path = Path(args.output).with_suffix(".cache.json")
+    cache = load_cache(cache_path)
+    if cache:
+        print(f"Cache : {len(cache)} entries loaded from {cache_path}")
+
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    try:
+        with open(args.output, "w", encoding="utf-8", buffering=1) as out_f:
+            preds, elapsed, n_failed = asyncio.run(
+                predict_all(client, inputs, args.concurrency, out_f, cache, cache_path)
+            )
+    except KeyboardInterrupt:
+        save_cache(cache, cache_path)
+        print(f"\nInterrupted. Cache saved to {cache_path}", file=sys.stderr)
+        sys.exit(0)
+
+    save_cache(cache, cache_path)
+    print(f"\nPredictions written to {args.output}")
+
+    avg_ms = elapsed / len(inputs) * 1000 if inputs else 0
+    print(f"\n{'=' * 50}")
+    print(f"  Model     : {MODEL_NAME}")
+    print(f"  Inputs    : {len(inputs)}")
+    print(f"  Failed    : {n_failed}/{len(inputs)} (fallback used)")
+    print(f"  Wall time : {elapsed:.2f}s")
+    print(f"  Avg/input : {avg_ms:.1f}ms")
+    if elapsed:
+        print(f"  Throughput: {len(inputs) / elapsed:.1f} inputs/s")
+
+    if golds:
+        acc = grade(preds, golds, verbose=args.verbose)
+        print(
+            f"\n  Accuracy (gold in top-3): {acc:.2%} ({int(acc * len(golds))}/{len(golds)})"
+        )
+    print(f"{'=' * 50}")
+
+
+if __name__ == "__main__":
+    main()
