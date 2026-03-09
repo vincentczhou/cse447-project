@@ -11,7 +11,9 @@ For each line in the input file, and for each position within that line, we:
 Output columns:
     seq_idx       int   - line index in the input file
     pos           int   - position within the line (1-indexed, i.e. target position)
-essa
+    candidates    str   - \x01-separated top-K token strings (e.g. "e\x01a\x01 \x01t\x01...")
+    kenlm_scores  str   - \x01-separated log10 probs, same order as candidates
+    gold          str   - the correct next token
 
 Usage:
     uv run python src/data/precompute_kenlm_candidates.py --split train --work_dir work --k 64
