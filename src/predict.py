@@ -94,6 +94,8 @@ def _score_topk_single(inp: str) -> tuple[list[str], list[str], list[float]]:
             scored.append((log_prob, token))
 
         topk = heapq.nlargest(_worker_k, scored, key=lambda x: x[0])
+        if not topk:
+            return (tokens, [], [])
         candidate_scores, candidate_tokens = zip(*topk)
 
         return (tokens, candidate_tokens, candidate_scores)
@@ -146,6 +148,10 @@ def _rerank_batched(
         cand_token_lists = []
 
         for j, (ctx_toks, cand_toks, cand_scores) in enumerate(batch_slice):
+            if cand_toks:
+                preds[batch_start + j] = "".join(
+                    [" " if t == SPACE_TOKEN else t for t in cand_toks[:top_n]]
+                )
             if not ctx_toks or not cand_toks or not cand_scores:
                 continue
             valid_offsets.append(j)
@@ -239,7 +245,7 @@ class TwoStagePredictor:
         print(f"KenLM: order={instance.kenlm_model.order}, vocab={len(instance.vocab)}")
 
         # Reranker (optional)
-        reranker_path = Path(work_dir) / RERANKER_CHECKPOINT
+        reranker_path = work_path / RERANKER_CHECKPOINT
         if reranker_path.exists():
             from train_reranker import load_for_inference
 
@@ -273,7 +279,7 @@ class TwoStagePredictor:
         self, data: list[str]
     ) -> list[tuple[list[str], list[str], list[float]]]:
         """Run KenLM scoring, return top-K candidates per input."""
-        num_workers = min(cpu_count(), MAX_WORKERS)
+        num_workers = min(cpu_count() or 1, MAX_WORKERS)
         # Note: candidate_k is candidate_size from config.yaml
         # If reranker is present, use candidate_k from config; otherwise use top_n for KenLM-only mode
         # If the reranker is trained off of unigram negatives, candidate_size is correct.
