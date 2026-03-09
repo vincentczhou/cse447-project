@@ -49,11 +49,20 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 # Multiprocessing helpers for data loading (module-level for pickling)
 # ---------------------------------------------------------------------------
 
+_mp_stoi: dict[str, int] = {}
+_mp_n_sequences: int = 0
+
+
+def _mp_init(stoi: dict[str, int], n_sequences: int = 0) -> None:
+    """Worker initializer — sets globals so stoi is pickled once per worker."""
+    global _mp_stoi, _mp_n_sequences
+    _mp_stoi = stoi
+    _mp_n_sequences = n_sequences
+
 
 def _mp_parse_tsv_chunk(
-    args: tuple[list[str], dict[str, int], int],
+    lines: list[str],
 ) -> list[tuple[int, int, list[int], list[float], int]]:
-    lines, stoi, n_sequences = args
     examples = []
     for line in lines:
         seq_idx_s, pos_s, cands_s, scores_s, gold = line.rstrip("\n").split(
@@ -61,10 +70,10 @@ def _mp_parse_tsv_chunk(
         )
         seq_idx = int(seq_idx_s)
         # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
-        if seq_idx >= n_sequences:
+        if seq_idx >= _mp_n_sequences:
             continue
         cand_tokens = cands_s.split("\x01")
-        cand_ids = [stoi.get(t, UNK_ID) for t in cand_tokens]
+        cand_ids = [_mp_stoi.get(t, UNK_ID) for t in cand_tokens]
         kenlm_scores = [float(s) for s in scores_s.split("\x01")]
         try:
             label = cand_tokens.index(gold)
@@ -80,21 +89,18 @@ def _mp_parse_tsv_chunk(
     return examples
 
 
-def _mp_parse_seq_chunk(
-    args: tuple[list[str], dict[str, int]],
-) -> list[list[int]]:
+def _mp_parse_seq_chunk(lines: list[str]) -> list[list[int]]:
     """Parse a chunk of tokenized text lines into lists of token IDs.
 
     Returns only sequences with >=2 tokens (need >=1 context + 1 target).
     Tensors are created in the main process to avoid pickling overhead.
     """
-    lines, stoi = args
     sequences: list[list[int]] = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        ids = [stoi.get(tok, UNK_ID) for tok in line.split()]
+        ids = [_mp_stoi.get(tok, UNK_ID) for tok in line.split()]
         if len(ids) >= 2:
             sequences.append(ids)
     return sequences
@@ -313,13 +319,15 @@ def load_sequences(
     n_workers = num_workers or os.cpu_count() or 1
     chunk_size = max(1, len(raw_lines) // (n_workers * 4))
     chunks = [
-        (raw_lines[i : i + chunk_size], stoi)
-        for i in range(0, len(raw_lines), chunk_size)
+        raw_lines[i : i + chunk_size] for i in range(0, len(raw_lines), chunk_size)
     ]
 
+    # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
+    # Initializer sends stoi once per worker instead of once per chunk.
+    ctx = multiprocessing.get_context("forkserver")
     # Workers return list[list[int]]; tensors are created here to avoid pickle overhead
     sequences: list[torch.Tensor] = []
-    with multiprocessing.Pool(n_workers) as pool:
+    with ctx.Pool(n_workers, initializer=_mp_init, initargs=(stoi,)) as pool:
         for chunk_result in tqdm(
             pool.imap(_mp_parse_seq_chunk, chunks),
             total=len(chunks),
@@ -637,12 +645,16 @@ class PrecomputedRerankerDataset(torch.utils.data.Dataset):
         n_workers = num_workers or os.cpu_count() or 1
         chunk_size = max(1, len(raw_lines) // (n_workers * 4))
         chunks = [
-            (raw_lines[i : i + chunk_size], stoi, len(sequences))
-            for i in range(0, len(raw_lines), chunk_size)
+            raw_lines[i : i + chunk_size] for i in range(0, len(raw_lines), chunk_size)
         ]
 
+        # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
+        # Initializer sends stoi + n_sequences once per worker instead of once per chunk.
+        ctx = multiprocessing.get_context("forkserver")
         examples: list[tuple[int, int, list[int], list[float], int]] = []
-        with multiprocessing.Pool(n_workers) as pool:
+        with ctx.Pool(
+            n_workers, initializer=_mp_init, initargs=(stoi, len(sequences))
+        ) as pool:
             for chunk_result in tqdm(
                 pool.imap(_mp_parse_tsv_chunk, chunks),
                 total=len(chunks),
