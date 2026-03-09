@@ -842,7 +842,11 @@ def load_for_inference(
     tokens = ckpt["tokens"]
 
     model = Reranker(cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # torch.compile wraps the model in a _orig_mod attribute; strip this prefix from state_dict keys so loading works regardless of compilation.
+    state_dict = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
@@ -1025,9 +1029,13 @@ def main() -> None:
 
     # ---- Export plain inference checkpoint (no Lightning needed at runtime) ----
     inference_path = out_dir / train_cfg.checkpoint_name
+    # torch.compile wraps the model in a _orig_mod attribute; strip this prefix from state_dict keys so loading works regardless of compilation.
+    state_dict = lit_model.model.state_dict()
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
     torch.save(
         {
-            "model_state_dict": lit_model.model.state_dict(),
+            "model_state_dict": state_dict,
             "tokens": tokens,
             "config": dataclasses.asdict(model_cfg),
         },

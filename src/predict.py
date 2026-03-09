@@ -261,11 +261,14 @@ class TwoStagePredictor:
     def run_pred(self, data: list[str], top_n: int = TOP_N) -> list[str]:
         """Two-stage prediction: KenLM top-K -> reranker top-n."""
         kenlm_results = self._kenlm_stage(data)
+        print(f"KenLM stage done: {len(kenlm_results)} results")
 
         if self.reranker is None:
-            return [self._kenlm_fallback(r, top_n) for r in kenlm_results]
+            preds = [self._kenlm_fallback(r, top_n) for r in kenlm_results]
+            print(f"KenLM-only predictions done: {len(preds)} outputs")
+            return preds
 
-        return _rerank_batched(
+        preds = _rerank_batched(
             reranker=self.reranker,
             stoi=self.reranker_stoi,
             kenlm_results=kenlm_results,
@@ -274,6 +277,8 @@ class TwoStagePredictor:
             batch_size=RERANKER_BATCH_SIZE,
             device=self.device,
         )
+        print(f"Reranker stage done: {len(preds)} outputs")
+        return preds
 
     def _kenlm_stage(
         self, data: list[str]
