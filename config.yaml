@@ -58,13 +58,20 @@ reranker:
   # --- Early stopping / best model ---
   early_stopping:
     patience: 20                # Epochs without improvement before stopping
-    metric: valid_top3         # "valid_top3" (higher=better) or "valid_loss" (lower=better)
+    metric: valid/top3         # Lightning-logged key: "valid/top3" (higher=better) or "valid/loss" (lower=better)
+    metric_mode: max           # "max" for top3, "min" for loss
 
   # --- Data paths (relative to repo root) ---
   data:
     train_path: data/madlad_multilang_clean_15k_optionB_kenlm/train.txt
     valid_path: data/madlad_multilang_clean_15k_optionB_kenlm/valid.txt
     vocab_path: data/madlad_multilang_clean_15k_optionB_kenlm/vocab.json
+    # Precomputed KenLM top-K candidate TSVs (output of precompute_kenlm_candidates.py).
+    # When both paths are set and the files exist, training uses hard KenLM negatives
+    # instead of random frequency-weighted negatives. candidate_size in training is
+    # ignored — K is determined by the TSV (the --k flag used during precomputation).
+    candidates_train_path: data/madlad_multilang_clean_15k_optionB_kenlm/candidates_train_k64_15k_char6_000122.tsv
+    candidates_valid_path: data/madlad_multilang_clean_15k_optionB_kenlm/candidates_valid_k64_15k_char6_000122.tsv
 
   # --- Data limits (for quick iteration / memory control, null = no limit) ---
   data_limits:

@@ -99,7 +99,8 @@ class TrainConfig:
 
     # Early stopping / best model
     patience: int = 3
-    metric: str = "valid_top3"
+    metric: str = "valid/top3"
+    metric_mode: str = "max"  # "max" for top3, "min" for loss
 
     # Data limits
     max_train_lines: int | None = None
@@ -183,6 +184,7 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         seed=tr.get("seed", train_cfg.seed),
         patience=es.get("patience", train_cfg.patience),
         metric=es.get("metric", train_cfg.metric),
+        metric_mode=es.get("metric_mode", train_cfg.metric_mode),
         max_train_lines=dl.get("max_train_lines", train_cfg.max_train_lines),
         max_valid_lines=dl.get("max_valid_lines", train_cfg.max_valid_lines),
         max_train_examples=dl.get("max_train_examples", train_cfg.max_train_examples),
@@ -477,7 +479,7 @@ def collate_reranker(
     candidate_size: int,
     unigram_probs: torch.Tensor,
     pad_id: int = PAD_ID,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Collate a batch of (context, target) pairs into padded tensors with
     vectorized negative sampling.
 
@@ -895,14 +897,14 @@ def main() -> None:
         ModelCheckpoint(
             dirpath=out_dir,
             filename="best_reranker",
-            monitor="valid/top3",
-            mode="max",
+            monitor=train_cfg.metric,
+            mode=train_cfg.metric_mode,
             save_top_k=1,
         ),
         EarlyStopping(
-            monitor="valid/top3",
+            monitor=train_cfg.metric,
             patience=train_cfg.patience,
-            mode="max",
+            mode=train_cfg.metric_mode,
         ),
     ]
 
