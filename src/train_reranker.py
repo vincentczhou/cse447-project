@@ -412,7 +412,7 @@ class Reranker(nn.Module):
         """Encode a padded context prefix into a single context vector per example.
 
         Args:
-            context_ids: [B, T] LongTensor of token IDs (left-padded with pad_id).
+            context_ids: [B, T] LongTensor of token IDs (right-padded with pad_id).
 
         Returns:
             ctx_vec: [B, D] context vector (hidden state at last non-pad position).
@@ -421,11 +421,8 @@ class Reranker(nn.Module):
         device = context_ids.device
 
         # Token + positional embeddings.
-        # We use left-padding, so the last real token is always at index T-1,
-        # making context vector extraction simple (no variable-length indexing).
-        # Tradeoff: real tokens get absolute positions offset by padding length
-        # rather than starting from 0, but training and evaluation use the same
-        # convention so the model learns to compensate.
+        # With right-padding, real tokens start at position 0 and get natural
+        # positional encodings regardless of batch max length.
         positions = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
         x = self.token_emb(context_ids) + self.pos_emb(positions)  # [B, T, D]
         x = self.emb_drop(x)
@@ -438,10 +435,8 @@ class Reranker(nn.Module):
 
         # Padding mask: -inf for pad positions, 0.0 for real tokens.
         # Shape [B, T] — PyTorch broadcasts this over attention heads.
-        pad_mask = torch.where(
-            context_ids == self.cfg.pad_id,
-            torch.tensor(float("-inf"), device=device, dtype=x.dtype),
-            torch.tensor(0.0, device=device, dtype=x.dtype),
+        pad_mask = torch.zeros(B, T, device=device, dtype=x.dtype).masked_fill(
+            context_ids == self.cfg.pad_id, float("-inf")
         )  # [B, T]
 
         # Run through Transformer
@@ -450,8 +445,9 @@ class Reranker(nn.Module):
         )
         x = self.final_norm(x)  # [B, T, D]
 
-        # With left-padding the last real token is always at position T-1.
-        ctx_vec = x[:, -1, :]  # [B, D]
+        # With right-padding, the last real token is at index (length - 1) per example.
+        lengths = (context_ids != self.cfg.pad_id).sum(dim=1)  # [B]
+        ctx_vec = x[torch.arange(B, device=device), lengths - 1, :]  # [B, D]
         return ctx_vec
 
     def score_candidates(
@@ -559,10 +555,10 @@ def collate_reranker(
         batch: list of (context_ids: [T_i], target_id: int) from RerankerDataset.
         candidate_size: M, total number of candidates per example.
         unigram_probs: [V] tensor of sampling probabilities for negatives.
-        pad_id: token ID used for left-padding contexts.
+        pad_id: token ID used for right-padding contexts.
 
     Returns:
-        context_ids:   [B, T_max] left-padded context token IDs.
+        context_ids:   [B, T_max] right-padded context token IDs.
         candidate_ids: [B, M] candidate token IDs (gold is hidden among negatives).
         labels:        [B] index of the gold target within each candidate set.
     """
@@ -570,11 +566,10 @@ def collate_reranker(
     B = len(contexts)
     M = candidate_size
 
-    # --- Left-pad contexts to the longest in the batch ---
-    max_len = max(c.size(0) for c in contexts)
-    context_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
-    for i, c in enumerate(contexts):
-        context_ids[i, max_len - c.size(0) :] = c
+    # --- Right-pad contexts to the longest in the batch ---
+    context_ids = torch.nn.utils.rnn.pad_sequence(
+        contexts, batch_first=True, padding_value=pad_id
+    )  # [B, T_max]
 
     # --- Vectorized negative sampling ---
     # Sample M candidates per example from unigram distribution
@@ -686,19 +681,18 @@ def collate_precomputed(
     """Collate precomputed-candidate examples into padded tensors.
 
     Simpler than collate_reranker — no negative sampling needed, candidates and
-    their KenLM scores are already fixed. Just left-pad contexts and stack tensors.
+    their KenLM scores are already fixed. Just right-pad contexts and stack tensors.
 
     Returns:
-        context_ids:   [B, T_max] left-padded context token IDs.
+        context_ids:   [B, T_max] right-padded context token IDs.
         candidate_ids: [B, M] precomputed candidate token IDs.
         kenlm_scores:  [B, M] KenLM log10 probs for each candidate.
         labels:        [B] index of the gold token within each candidate set.
     """
     contexts, candidate_ids_list, kenlm_scores_list, labels = zip(*batch)
-    max_len = max(c.size(0) for c in contexts)
-    context_ids = torch.full((len(contexts), max_len), pad_id, dtype=torch.long)
-    for i, c in enumerate(contexts):
-        context_ids[i, max_len - c.size(0) :] = c
+    context_ids = torch.nn.utils.rnn.pad_sequence(
+        contexts, batch_first=True, padding_value=pad_id
+    )  # [B, T_max]
     return (
         context_ids,
         torch.stack(
