@@ -20,6 +20,7 @@ import os
 import random
 from dataclasses import dataclass
 from functools import partial
+from itertools import islice
 from pathlib import Path
 
 from tqdm import tqdm
@@ -51,6 +52,17 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 _mp_stoi: dict[str, int] = {}
 _mp_n_sequences: int = 0
+
+LOAD_CHUNK_SIZE = 10_000  # lines per chunk for streaming file reads
+
+
+def _iter_line_chunks(f, chunk_size: int = LOAD_CHUNK_SIZE):
+    """Yield successive chunks of lines from a file handle, reading lazily."""
+    while True:
+        chunk = list(islice(f, chunk_size))
+        if not chunk:
+            break
+        yield chunk
 
 
 def _mp_init(stoi: dict[str, int], n_sequences: int = 0) -> None:
@@ -125,6 +137,7 @@ class RerankerConfig:
     pad_id: int = PAD_ID
     norm_first: bool = True
     temperature: float = 1.0
+    alpha: float = 0.0
 
 
 @dataclass
@@ -211,6 +224,7 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
             max_context_len=arch.get("max_context_len", model_cfg.max_context_len),
             norm_first=arch.get("norm_first", model_cfg.norm_first),
             temperature=arch.get("temperature", model_cfg.temperature),
+            alpha=arch.get("alpha", model_cfg.alpha),
         )
 
     # Training + early_stopping + data + data_limits + output + logging -> TrainConfig
@@ -310,32 +324,31 @@ def load_sequences(
     max_lines: int | None = None,
     num_workers: int = 0,
 ) -> list[torch.Tensor]:
-    """Load tokenized text file into a list of 1-D LongTensors."""
-    with path.open("r", encoding="utf-8") as f:
-        raw_lines = f.readlines()
-    if max_lines is not None:
-        raw_lines = raw_lines[:max_lines]
+    """Load tokenized text file into a list of 1-D LongTensors.
 
+    Streams the file lazily in chunks to avoid loading it all into memory.
+    """
     n_workers = num_workers or os.cpu_count() or 1
-    chunk_size = max(1, len(raw_lines) // (n_workers * 4))
-    chunks = [
-        raw_lines[i : i + chunk_size] for i in range(0, len(raw_lines), chunk_size)
-    ]
 
     # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
     # Initializer sends stoi once per worker instead of once per chunk.
     ctx = multiprocessing.get_context("forkserver")
     # Workers return list[list[int]]; tensors are created here to avoid pickle overhead
     sequences: list[torch.Tensor] = []
-    with ctx.Pool(n_workers, initializer=_mp_init, initargs=(stoi,)) as pool:
-        for chunk_result in tqdm(
-            pool.imap(_mp_parse_seq_chunk, chunks),
-            total=len(chunks),
-            desc=f"Loading {path.name}",
-        ):
-            sequences.extend(
-                torch.tensor(ids, dtype=torch.long) for ids in chunk_result
-            )
+    with path.open("r", encoding="utf-8") as f:
+        line_iter = islice(f, max_lines) if max_lines is not None else f
+        pool = ctx.Pool(n_workers, initializer=_mp_init, initargs=(stoi,))
+        try:
+            for chunk_result in tqdm(
+                pool.imap(_mp_parse_seq_chunk, _iter_line_chunks(line_iter)),
+                desc=f"Loading {path.name}",
+            ):
+                sequences.extend(
+                    torch.tensor(ids, dtype=torch.long) for ids in chunk_result
+                )
+        finally:
+            pool.close()
+            pool.join()
     return sequences
 
 
@@ -398,13 +411,10 @@ class Reranker(nn.Module):
             torch.tensor(math.log(cfg.temperature), dtype=torch.float)
         )
 
-        # Learnable KenLM fusion weight. When precomputed candidates are used,
-        # final logits = neural_logits + alpha * kenlm_log10_prob.
-        # Initialized to 0 so training starts with pure neural scoring;
-        # the model learns how much to trust KenLM. When kenlm_scores are
-        # zeros (random-negative training), this parameter has no gradient
-        # and stays at 0 harmlessly.
-        self.alpha = nn.Parameter(torch.tensor(0.0))
+        # Fixed KenLM fusion weight (not learned). When precomputed candidates
+        # are used, final logits = neural_logits + alpha * kenlm_log10_prob.
+        # Set via config.yaml (architecture.alpha). Default 0 = pure neural.
+        self.alpha = cfg.alpha
 
         self._init_weights()
 
@@ -638,29 +648,26 @@ class PrecomputedRerankerDataset(torch.utils.data.Dataset):
         self.sequences = sequences
         self.max_context_len = max_context_len
 
-        with tsv_path.open("r", encoding="utf-8") as f:
-            next(f)  # skip header
-            raw_lines = f.readlines()
-
         n_workers = num_workers or os.cpu_count() or 1
-        chunk_size = max(1, len(raw_lines) // (n_workers * 4))
-        chunks = [
-            raw_lines[i : i + chunk_size] for i in range(0, len(raw_lines), chunk_size)
-        ]
 
         # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
         # Initializer sends stoi + n_sequences once per worker instead of once per chunk.
         ctx = multiprocessing.get_context("forkserver")
         examples: list[tuple[int, int, list[int], list[float], int]] = []
-        with ctx.Pool(
-            n_workers, initializer=_mp_init, initargs=(stoi, len(sequences))
-        ) as pool:
-            for chunk_result in tqdm(
-                pool.imap(_mp_parse_tsv_chunk, chunks),
-                total=len(chunks),
-                desc=f"Loading {tsv_path.name}",
-            ):
-                examples.extend(chunk_result)
+        with tsv_path.open("r", encoding="utf-8") as f:
+            next(f)  # skip header
+            pool = ctx.Pool(
+                n_workers, initializer=_mp_init, initargs=(stoi, len(sequences))
+            )
+            try:
+                for chunk_result in tqdm(
+                    pool.imap(_mp_parse_tsv_chunk, _iter_line_chunks(f)),
+                    desc=f"Loading {tsv_path.name}",
+                ):
+                    examples.extend(chunk_result)
+            finally:
+                pool.close()
+                pool.join()
 
         if max_examples is not None and len(examples) > max_examples:
             random.shuffle(examples)
@@ -1025,7 +1032,12 @@ def main() -> None:
         limit_val_batches=train_cfg.max_eval_batches or 1.0,
     )
 
-    trainer.fit(lit_model, train_loader, valid_loader, ckpt_path=train_cfg.resume_from)
+    try:
+        trainer.fit(
+            lit_model, train_loader, valid_loader, ckpt_path=train_cfg.resume_from
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving checkpoint with current weights...")
 
     # ---- Export plain inference checkpoint (no Lightning needed at runtime) ----
     inference_path = out_dir / train_cfg.checkpoint_name
