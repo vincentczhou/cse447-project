@@ -32,6 +32,7 @@ buffer = []
 
 out_dir = DATA_DIR / build_cfg["output_dir"]
 out_dir.mkdir(parents=True, exist_ok=True)
+(out_dir / "parts").mkdir(parents=True, exist_ok=True)
 
 features = Features({"lang": Value("string"), "text": Value("string")})
 
