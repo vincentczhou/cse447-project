@@ -12,7 +12,6 @@ Expected input files (from src/data/preprocess.py):
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import json
 import math
@@ -567,10 +566,12 @@ class PrecomputedRerankerDataset(torch.utils.data.Dataset):
         self.max_context_len = max_context_len
 
         examples: list[tuple[int, int, list[int], list[float], int]] = []
-        with tsv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f, delimiter="\t")
-            next(reader)  # skip header
-            for seq_idx_s, pos_s, cands_s, scores_s, gold in reader:
+        with tsv_path.open("r", encoding="utf-8") as f:
+            next(f)  # skip header
+            for line in f:
+                seq_idx_s, pos_s, cands_s, scores_s, gold = line.rstrip("\n").split(
+                    "\t", maxsplit=4
+                )
                 seq_idx = int(seq_idx_s)
                 # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
                 if seq_idx >= len(sequences):
