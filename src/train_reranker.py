@@ -15,10 +15,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import multiprocessing
+import os
 import random
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+
+from tqdm import tqdm
 
 import lightning as L
 import torch
@@ -40,6 +44,60 @@ PAD_ID = 0
 UNK_ID = 1
 
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+
+# ---------------------------------------------------------------------------
+# Multiprocessing helpers for data loading (module-level for pickling)
+# ---------------------------------------------------------------------------
+
+
+def _mp_parse_tsv_chunk(
+    args: tuple[list[str], dict[str, int], int],
+) -> list[tuple[int, int, list[int], list[float], int]]:
+    lines, stoi, n_sequences = args
+    examples = []
+    for line in lines:
+        seq_idx_s, pos_s, cands_s, scores_s, gold = line.rstrip("\n").split(
+            "\t", maxsplit=4
+        )
+        seq_idx = int(seq_idx_s)
+        # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
+        if seq_idx >= n_sequences:
+            continue
+        cand_tokens = cands_s.split("\x01")
+        cand_ids = [stoi.get(t, UNK_ID) for t in cand_tokens]
+        kenlm_scores = [float(s) for s in scores_s.split("\x01")]
+        try:
+            label = cand_tokens.index(gold)
+        except ValueError:
+            # Shouldn't happen — gold is force-included during precomputation.
+            # If it does, the TSV is corrupt or the vocab mapping is wrong.
+            print(
+                f"WARNING: gold token {gold!r} not found in candidates at "
+                f"seq_idx={seq_idx_s}, pos={pos_s}. Defaulting label to 0."
+            )
+            label = 0
+        examples.append((seq_idx, int(pos_s), cand_ids, kenlm_scores, label))
+    return examples
+
+
+def _mp_parse_seq_chunk(
+    args: tuple[list[str], dict[str, int]],
+) -> list[list[int]]:
+    """Parse a chunk of tokenized text lines into lists of token IDs.
+
+    Returns only sequences with >=2 tokens (need >=1 context + 1 target).
+    Tensors are created in the main process to avoid pickling overhead.
+    """
+    lines, stoi = args
+    sequences: list[list[int]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        ids = [stoi.get(tok, UNK_ID) for tok in line.split()]
+        if len(ids) >= 2:
+            sequences.append(ids)
+    return sequences
 
 
 # ---------------------------------------------------------------------------
@@ -244,21 +302,32 @@ def load_sequences(
     path: Path,
     stoi: dict[str, int],
     max_lines: int | None = None,
+    num_workers: int = 0,
 ) -> list[torch.Tensor]:
     """Load tokenized text file into a list of 1-D LongTensors."""
-    sequences: list[torch.Tensor] = []
     with path.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if max_lines is not None and i >= max_lines:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            ids = [stoi.get(tok, UNK_ID) for tok in line.split()]
-            if (
-                len(ids) >= 2
-            ):  # need >=1 context token + 1 target token; single-token seqs yield no training examples
-                sequences.append(torch.tensor(ids, dtype=torch.long))
+        raw_lines = f.readlines()
+    if max_lines is not None:
+        raw_lines = raw_lines[:max_lines]
+
+    n_workers = num_workers or os.cpu_count() or 1
+    chunk_size = max(1, len(raw_lines) // (n_workers * 4))
+    chunks = [
+        (raw_lines[i : i + chunk_size], stoi)
+        for i in range(0, len(raw_lines), chunk_size)
+    ]
+
+    # Workers return list[list[int]]; tensors are created here to avoid pickle overhead
+    sequences: list[torch.Tensor] = []
+    with multiprocessing.Pool(n_workers) as pool:
+        for chunk_result in tqdm(
+            pool.imap(_mp_parse_seq_chunk, chunks),
+            total=len(chunks),
+            desc=f"Loading {path.name}",
+        ):
+            sequences.extend(
+                torch.tensor(ids, dtype=torch.long) for ids in chunk_result
+            )
     return sequences
 
 
@@ -561,35 +630,30 @@ class PrecomputedRerankerDataset(torch.utils.data.Dataset):
         stoi: dict[str, int],
         max_context_len: int,
         max_examples: int | None = None,
+        num_workers: int = 0,
     ):
         self.sequences = sequences
         self.max_context_len = max_context_len
 
-        examples: list[tuple[int, int, list[int], list[float], int]] = []
         with tsv_path.open("r", encoding="utf-8") as f:
             next(f)  # skip header
-            for line in f:
-                seq_idx_s, pos_s, cands_s, scores_s, gold = line.rstrip("\n").split(
-                    "\t", maxsplit=4
-                )
-                seq_idx = int(seq_idx_s)
-                # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
-                if seq_idx >= len(sequences):
-                    continue
-                cand_tokens = cands_s.split("\x01")
-                cand_ids = [stoi.get(t, UNK_ID) for t in cand_tokens]
-                kenlm_scores = [float(s) for s in scores_s.split("\x01")]
-                try:
-                    label = cand_tokens.index(gold)
-                except ValueError:
-                    # Shouldn't happen — gold is force-included during precomputation.
-                    # If it does, the TSV is corrupt or the vocab mapping is wrong.
-                    print(
-                        f"WARNING: gold token {gold!r} not found in candidates at "
-                        f"seq_idx={seq_idx_s}, pos={pos_s}. Defaulting label to 0."
-                    )
-                    label = 0
-                examples.append((seq_idx, int(pos_s), cand_ids, kenlm_scores, label))
+            raw_lines = f.readlines()
+
+        n_workers = num_workers or os.cpu_count() or 1
+        chunk_size = max(1, len(raw_lines) // (n_workers * 4))
+        chunks = [
+            (raw_lines[i : i + chunk_size], stoi, len(sequences))
+            for i in range(0, len(raw_lines), chunk_size)
+        ]
+
+        examples: list[tuple[int, int, list[int], list[float], int]] = []
+        with multiprocessing.Pool(n_workers) as pool:
+            for chunk_result in tqdm(
+                pool.imap(_mp_parse_tsv_chunk, chunks),
+                total=len(chunks),
+                desc=f"Loading {tsv_path.name}",
+            ):
+                examples.extend(chunk_result)
 
         if max_examples is not None and len(examples) > max_examples:
             random.shuffle(examples)
@@ -799,11 +863,19 @@ def main() -> None:
     stoi = {tok: i for i, tok in enumerate(tokens)}
     print(f"Vocab: {len(tokens)} tokens")
 
+    print(f"Loading sequences from {train_cfg.train_path}")
     train_seqs = load_sequences(
-        Path(train_cfg.train_path), stoi, train_cfg.max_train_lines
+        Path(train_cfg.train_path),
+        stoi,
+        train_cfg.max_train_lines,
+        num_workers=train_cfg.num_workers,
     )
+    print(f"Loading sequences from {train_cfg.valid_path}")
     valid_seqs = load_sequences(
-        Path(train_cfg.valid_path), stoi, train_cfg.max_valid_lines
+        Path(train_cfg.valid_path),
+        stoi,
+        train_cfg.max_valid_lines,
+        num_workers=train_cfg.num_workers,
     )
     print(f"Train: {len(train_seqs)} sequences, Valid: {len(valid_seqs)} sequences")
 
@@ -829,19 +901,23 @@ def main() -> None:
         print(
             f"Using precomputed KenLM candidates: {cand_train.name}, {cand_valid.name}"
         )
+        print(f"Loading train candidates from {cand_train}")
         train_ds = PrecomputedRerankerDataset(
             cand_train,
             train_seqs,
             stoi,
             model_cfg.max_context_len,
             train_cfg.max_train_examples,
+            num_workers=train_cfg.num_workers,
         )
+        print(f"Loading valid candidates from {cand_valid}")
         valid_ds = PrecomputedRerankerDataset(
             cand_valid,
             valid_seqs,
             stoi,
             model_cfg.max_context_len,
             train_cfg.max_valid_examples,
+            num_workers=train_cfg.num_workers,
         )
         collate_fn = partial(collate_precomputed, pad_id=model_cfg.pad_id)
     else:
