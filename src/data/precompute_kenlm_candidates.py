@@ -11,9 +11,7 @@ For each line in the input file, and for each position within that line, we:
 Output columns:
     seq_idx       int   - line index in the input file
     pos           int   - position within the line (1-indexed, i.e. target position)
-    candidates    str   - \x01-separated top-K token strings (e.g. "e\x01a\x01 \x01t\x01...")
-    kenlm_scores  str   - \x01-separated log10 probs, same order as candidates
-    gold          str   - the correct next token
+essa
 
 Usage:
     uv run python src/data/precompute_kenlm_candidates.py --split train --work_dir work --k 64
@@ -240,7 +238,8 @@ def main() -> None:
                 for rows in pool.imap_unordered(
                     _process_line, tasks, chunksize=chunksize
                 ):
-                    out_f.write("\n".join(rows) + "\n")
+                    if rows:
+                        out_f.write("\n".join(rows) + "\n")
                     total_rows += len(rows)
                     pbar.update(1)
                     pbar.set_postfix(rows=f"{total_rows:,}")
