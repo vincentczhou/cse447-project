@@ -12,6 +12,7 @@ Expected input files (from src/data/preprocess.py):
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import json
 import math
@@ -71,6 +72,11 @@ class TrainConfig:
     train_path: str = "data/madlad_multilang_clean_15k_optionB_kenlm/train.txt"
     valid_path: str = "data/madlad_multilang_clean_15k_optionB_kenlm/valid.txt"
     vocab_path: str = "data/madlad_multilang_clean_15k_optionB_kenlm/vocab.json"
+    # Precomputed KenLM candidate TSVs (from precompute_kenlm_candidates.py).
+    # When both are set and exist, hard KenLM negatives are used instead of random
+    # negatives. candidate_size is ignored — K comes from the TSV's --k flag.
+    candidates_train_path: str | None = None
+    candidates_valid_path: str | None = None
     out_dir: str = "work"
     checkpoint_name: str = "reranker.pt"
     resume_from: str | None = None
@@ -182,6 +188,12 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         max_train_examples=dl.get("max_train_examples", train_cfg.max_train_examples),
         max_valid_examples=dl.get("max_valid_examples", train_cfg.max_valid_examples),
         max_eval_batches=dl.get("max_eval_batches", train_cfg.max_eval_batches),
+        candidates_train_path=data.get(
+            "candidates_train_path", train_cfg.candidates_train_path
+        ),
+        candidates_valid_path=data.get(
+            "candidates_valid_path", train_cfg.candidates_valid_path
+        ),
         wandb_project=wandb_cfg.get("project", train_cfg.wandb_project)
         if wandb_cfg.get("enabled", True)
         else None,
@@ -206,11 +218,9 @@ def load_vocab(vocab_path: Path) -> tuple[list[str], torch.Tensor]:
         tokens: list of token strings indexed by ID.
         unigram_probs: [V] tensor of normalized probabilities (pad=0).
     """
-    # TODO(kenlm-integration): Currently returns unigram frequency probs for
-    # random negative sampling.  Once KenLM is integrated, replace this with
-    # a loader that reads precomputed per-position KenLM top-K candidate sets
-    # so the reranker trains on realistic "hard" negatives instead of random
-    # frequency-weighted ones.  See also: collate_reranker().
+    # Unigram probs are used as sampling weights for random negatives in
+    # collate_reranker(). When training with precomputed KenLM candidates,
+    # negatives come from the TSV and these probs are unused.
     with vocab_path.open("r", encoding="utf-8") as f:
         vocab_counts: dict[str, int] = json.load(f)
 
@@ -310,6 +320,14 @@ class Reranker(nn.Module):
             torch.tensor(math.log(cfg.temperature), dtype=torch.float)
         )
 
+        # Learnable KenLM fusion weight. When precomputed candidates are used,
+        # final logits = neural_logits + alpha * kenlm_log10_prob.
+        # Initialized to 0 so training starts with pure neural scoring;
+        # the model learns how much to trust KenLM. When kenlm_scores are
+        # zeros (random-negative training), this parameter has no gradient
+        # and stays at 0 harmlessly.
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -367,13 +385,21 @@ class Reranker(nn.Module):
         return ctx_vec
 
     def score_candidates(
-        self, context_ids: torch.Tensor, candidate_ids: torch.Tensor
+        self,
+        context_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        kenlm_scores: torch.Tensor,
     ) -> torch.Tensor:
         """Score each candidate character given a context prefix.
 
         Args:
-            context_ids:  [B, T] padded context prefix token IDs.
+            context_ids:   [B, T] padded context prefix token IDs.
             candidate_ids: [B, M] candidate character token IDs.
+            kenlm_scores:  [B, M] KenLM log10 probs. Blended as:
+                               logits += alpha * kenlm_scores
+                           where alpha is a learned scalar (init 0 = pure neural).
+                           Pass zeros when KenLM scores are unavailable (e.g.
+                           random-negative training) — alpha has no effect.
 
         Returns:
             logits: [B, M] unnormalized scores (higher = more likely).
@@ -384,9 +410,9 @@ class Reranker(nn.Module):
         # Dot-product scoring: logit_m = ctx_vec · cand_emb_m
         logits = torch.einsum("bd,bmd->bm", ctx_vec, cand_emb)  # [B, M]
 
-        # Temperature scaling
-        temperature = self.log_temperature.exp()
-        logits = logits / temperature
+        # Temperature scaling then KenLM fusion
+        logits = logits / self.log_temperature.exp()
+        logits = logits + self.alpha * kenlm_scores
 
         return logits
 
@@ -470,11 +496,6 @@ def collate_reranker(
         candidate_ids: [B, M] candidate token IDs (gold is hidden among negatives).
         labels:        [B] index of the gold target within each candidate set.
     """
-    # TODO(kenlm-integration): Replace unigram negative sampling with
-    # precomputed KenLM top-K candidate sets for realistic hard negatives.
-    # When that happens, this function would read candidates from the batch
-    # instead of sampling them here.
-
     contexts, targets = zip(*batch)
     B = len(contexts)
     M = candidate_size
@@ -498,7 +519,127 @@ def collate_reranker(
     labels = torch.randint(0, M, (B,))  # [B] — random position for gold
     candidate_ids[torch.arange(B), labels] = gold
 
-    return context_ids, candidate_ids, labels
+    # kenlm_scores are zeros — not available for random negatives.
+    # Shape matches precomputed collate so training_step has a uniform interface.
+    kenlm_scores = torch.zeros(B, M, dtype=torch.float)
+
+    return context_ids, candidate_ids, kenlm_scores, labels
+
+
+# ---------------------------------------------------------------------------
+# Precomputed-candidate dataset & collation
+# ---------------------------------------------------------------------------
+
+
+class PrecomputedRerankerDataset(torch.utils.data.Dataset):
+    """Dataset backed by a precomputed KenLM top-K candidate TSV.
+
+    Each TSV row is one training example. Candidates are the KenLM top-K tokens
+    for that (seq_idx, pos) — hard negatives the reranker must distinguish from
+    gold. This is strictly better than random frequency-weighted negatives because
+    the model sees realistic confusable characters.
+
+    The candidate set size M is fixed by the TSV's --k flag. The `candidate_size`
+    field in TrainConfig is ignored when this dataset is active.
+
+    TSV format (tab-separated; candidates/scores use \\x01 as intra-field sep):
+        seq_idx  pos  candidates  kenlm_scores  gold
+
+    Args:
+        tsv_path: Path to the precomputed TSV.
+        sequences: Token-ID tensors from load_sequences(), indexed by seq_idx.
+        stoi: Token-string → ID mapping.
+        max_context_len: Context window; context = seq[max(0, pos-L) : pos].
+        max_examples: Cap dataset size; rows are shuffled then truncated.
+    """
+
+    def __init__(
+        self,
+        tsv_path: Path,
+        sequences: list[torch.Tensor],
+        stoi: dict[str, int],
+        max_context_len: int,
+        max_examples: int | None = None,
+    ):
+        self.sequences = sequences
+        self.max_context_len = max_context_len
+
+        examples: list[tuple[int, int, list[int], list[float], int]] = []
+        with tsv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f, delimiter="\t")
+            next(reader)  # skip header
+            for seq_idx_s, pos_s, cands_s, scores_s, gold in reader:
+                seq_idx = int(seq_idx_s)
+                # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
+                if seq_idx >= len(sequences):
+                    continue
+                cand_tokens = cands_s.split("\x01")
+                cand_ids = [stoi.get(t, UNK_ID) for t in cand_tokens]
+                kenlm_scores = [float(s) for s in scores_s.split("\x01")]
+                try:
+                    label = cand_tokens.index(gold)
+                except ValueError:
+                    # Shouldn't happen — gold is force-included during precomputation.
+                    # If it does, the TSV is corrupt or the vocab mapping is wrong.
+                    print(
+                        f"WARNING: gold token {gold!r} not found in candidates at "
+                        f"seq_idx={seq_idx_s}, pos={pos_s}. Defaulting label to 0."
+                    )
+                    label = 0
+                examples.append((seq_idx, int(pos_s), cand_ids, kenlm_scores, label))
+
+        if max_examples is not None and len(examples) > max_examples:
+            random.shuffle(examples)
+            examples = examples[:max_examples]
+
+        self.examples = examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        seq_idx, pos, cand_ids, kenlm_scores, label = self.examples[idx]
+        seq = self.sequences[seq_idx]
+        ctx_start = max(0, pos - self.max_context_len)
+        context = seq[ctx_start:pos]  # 1-D LongTensor, length 1..max_context_len
+        return (
+            context,
+            torch.tensor(cand_ids, dtype=torch.long),
+            torch.tensor(kenlm_scores, dtype=torch.float),
+            label,
+        )
+
+
+def collate_precomputed(
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]],
+    pad_id: int = PAD_ID,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collate precomputed-candidate examples into padded tensors.
+
+    Simpler than collate_reranker — no negative sampling needed, candidates and
+    their KenLM scores are already fixed. Just left-pad contexts and stack tensors.
+
+    Returns:
+        context_ids:   [B, T_max] left-padded context token IDs.
+        candidate_ids: [B, M] precomputed candidate token IDs.
+        kenlm_scores:  [B, M] KenLM log10 probs for each candidate.
+        labels:        [B] index of the gold token within each candidate set.
+    """
+    contexts, candidate_ids_list, kenlm_scores_list, labels = zip(*batch)
+    max_len = max(c.size(0) for c in contexts)
+    context_ids = torch.full((len(contexts), max_len), pad_id, dtype=torch.long)
+    for i, c in enumerate(contexts):
+        context_ids[i, max_len - c.size(0) :] = c
+    return (
+        context_ids,
+        torch.stack(
+            candidate_ids_list
+        ),  # [B, M] — each element is already a [M] tensor
+        torch.stack(kenlm_scores_list),  # [B, M]
+        torch.tensor(labels, dtype=torch.long),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +676,8 @@ class RerankerLightningModule(L.LightningModule):
         self.register_buffer("unigram_probs", unigram_probs)
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        context_ids, candidate_ids, labels = batch
-        logits = self.model.score_candidates(context_ids, candidate_ids)
+        context_ids, candidate_ids, kenlm_scores, labels = batch
+        logits = self.model.score_candidates(context_ids, candidate_ids, kenlm_scores)
         loss = F.cross_entropy(logits, labels)
         self.log(
             "train/loss",
@@ -549,8 +690,8 @@ class RerankerLightningModule(L.LightningModule):
         return loss
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
-        context_ids, candidate_ids, labels = batch
-        logits = self.model.score_candidates(context_ids, candidate_ids)
+        context_ids, candidate_ids, kenlm_scores, labels = batch
+        logits = self.model.score_candidates(context_ids, candidate_ids, kenlm_scores)
         loss = F.cross_entropy(logits, labels)
         top1 = (logits.argmax(dim=1) == labels).float().mean()
         k = min(3, logits.size(1))
@@ -664,20 +805,59 @@ def main() -> None:
     print(f"Train: {len(train_seqs)} sequences, Valid: {len(valid_seqs)} sequences")
 
     # ---- Datasets & DataLoaders ----
-    train_ds = RerankerDataset(
-        train_seqs, model_cfg.max_context_len, train_cfg.max_train_examples
+    cand_train = (
+        Path(train_cfg.candidates_train_path)
+        if train_cfg.candidates_train_path
+        else None
     )
-    valid_ds = RerankerDataset(
-        valid_seqs, model_cfg.max_context_len, train_cfg.max_valid_examples
+    cand_valid = (
+        Path(train_cfg.candidates_valid_path)
+        if train_cfg.candidates_valid_path
+        else None
     )
-    print(f"Train examples: {len(train_ds)}, Valid examples: {len(valid_ds)}")
+    use_precomputed = (
+        cand_train is not None
+        and cand_train.exists()
+        and cand_valid is not None
+        and cand_valid.exists()
+    )
 
-    collate_fn = partial(
-        collate_reranker,
-        candidate_size=train_cfg.candidate_size,
-        unigram_probs=unigram_probs,
-        pad_id=model_cfg.pad_id,
-    )
+    if use_precomputed:
+        print(
+            f"Using precomputed KenLM candidates: {cand_train.name}, {cand_valid.name}"
+        )
+        train_ds = PrecomputedRerankerDataset(
+            cand_train,
+            train_seqs,
+            stoi,
+            model_cfg.max_context_len,
+            train_cfg.max_train_examples,
+        )
+        valid_ds = PrecomputedRerankerDataset(
+            cand_valid,
+            valid_seqs,
+            stoi,
+            model_cfg.max_context_len,
+            train_cfg.max_valid_examples,
+        )
+        collate_fn = partial(collate_precomputed, pad_id=model_cfg.pad_id)
+    else:
+        print(
+            "Using random frequency-weighted negatives (no precomputed candidates found)"
+        )
+        train_ds = RerankerDataset(
+            train_seqs, model_cfg.max_context_len, train_cfg.max_train_examples
+        )
+        valid_ds = RerankerDataset(
+            valid_seqs, model_cfg.max_context_len, train_cfg.max_valid_examples
+        )
+        collate_fn = partial(
+            collate_reranker,
+            candidate_size=train_cfg.candidate_size,
+            unigram_probs=unigram_probs,
+            pad_id=model_cfg.pad_id,
+        )
+    print(f"Train examples: {len(train_ds)}, Valid examples: {len(valid_ds)}")
     use_gpu = not train_cfg.cpu and torch.cuda.is_available()
     train_loader = torch.utils.data.DataLoader(
         train_ds,
