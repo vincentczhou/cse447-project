@@ -190,6 +190,10 @@ class TrainConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None
 
+    # Checkpointing
+    every_n_train_steps: int | None = None
+    save_on_train_epoch_end: bool | None = None
+
     # Misc
     seed: int = 42
     log_every: int = 100
@@ -280,6 +284,12 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         wandb_run_name=wandb_cfg.get("run_name", train_cfg.wandb_run_name),
         log_every=log.get("log_every", train_cfg.log_every),
         num_workers=log.get("num_workers", train_cfg.num_workers),
+        every_n_train_steps=out.get(
+            "every_n_train_steps", train_cfg.every_n_train_steps
+        ),
+        save_on_train_epoch_end=out.get(
+            "save_on_train_epoch_end", train_cfg.save_on_train_epoch_end
+        ),
     )
 
     return model_cfg, train_cfg
@@ -994,6 +1004,8 @@ def main() -> None:
             monitor=train_cfg.metric,
             mode=train_cfg.metric_mode,
             save_top_k=1,
+            every_n_train_steps=train_cfg.every_n_train_steps,
+            save_on_train_epoch_end=train_cfg.save_on_train_epoch_end,
         ),
         EarlyStopping(
             monitor=train_cfg.metric,
