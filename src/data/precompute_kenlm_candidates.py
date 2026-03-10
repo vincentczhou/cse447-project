@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import itertools
 import json
 import random
 import sys
@@ -55,16 +56,27 @@ _worker_model: kenlm.Model | None = None
 _worker_vocab_tokens: list[str] | None = None
 _worker_k: int | None = None
 _worker_positions_per_line: int | None = None
+_worker_last_position_only: bool = False
 
 
 def _worker_init(
-    model_path: str, vocab_tokens: list[str], k: int, positions_per_line: int | None
+    model_path: str,
+    vocab_tokens: list[str],
+    k: int,
+    positions_per_line: int | None,
+    last_position_only: bool = False,
 ) -> None:
-    global _worker_model, _worker_vocab_tokens, _worker_k, _worker_positions_per_line
+    global \
+        _worker_model, \
+        _worker_vocab_tokens, \
+        _worker_k, \
+        _worker_positions_per_line, \
+        _worker_last_position_only
     _worker_model = kenlm.Model(model_path)
     _worker_vocab_tokens = vocab_tokens
     _worker_k = k
     _worker_positions_per_line = positions_per_line
+    _worker_last_position_only = last_position_only
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +98,13 @@ def _process_line(args: tuple[int, list[str]]) -> list[str]:
     vocab_tokens = _worker_vocab_tokens
     k = _worker_k
     positions_per_line = _worker_positions_per_line
+    last_position_only = _worker_last_position_only
 
     # Positions where we emit a row: pos >= 1 (need at least one context token)
     valid_positions = range(1, len(tokens))
-    if positions_per_line is not None and positions_per_line < len(valid_positions):
+    if last_position_only:
+        emit_set = {len(tokens) - 1} if len(tokens) > 1 else set()
+    elif positions_per_line is not None and positions_per_line < len(valid_positions):
         emit_set = set(random.sample(list(valid_positions), positions_per_line))
     else:
         emit_set = set(valid_positions)
@@ -143,7 +158,16 @@ def _process_line(args: tuple[int, list[str]]) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Precompute KenLM top-K candidates")
-    parser.add_argument("--split", choices=("train", "valid"), required=True)
+    parser.add_argument(
+        "--split",
+        choices=("train", "valid"),
+        default=None,
+        help="Use train/valid path from config (required unless --input is given)",
+    )
+    parser.add_argument(
+        "--input", default=None, help="Custom input file (overrides --split)"
+    )
+    parser.add_argument("--output", default=None, help="Custom output TSV path")
     parser.add_argument("--work_dir", default="work")
     parser.add_argument("--k", type=int, default=64)
     parser.add_argument(
@@ -158,13 +182,23 @@ def main() -> None:
         default=None,
         help="Randomly sample this many positions per line (default: all positions)",
     )
+    parser.add_argument(
+        "--last_position_only",
+        action="store_true",
+        help="Only emit the last position per line (for distillation)",
+    )
     parser.add_argument("--num_workers", type=int, default=cpu_count())
     args = parser.parse_args()
+
+    if args.input is None and args.split is None:
+        parser.error("Either --split or --input is required")
 
     work_dir = Path(args.work_dir)
     data_cfg = _RCFG.get("data", {})
 
-    if args.split == "train":
+    if args.input is not None:
+        input_path = Path(args.input)
+    elif args.split == "train":
         input_path = _REPO / data_cfg.get(
             "train_path", "data/madlad_multilang_clean_15k_optionB_kenlm/train.txt"
         )
@@ -172,10 +206,15 @@ def main() -> None:
         input_path = _REPO / data_cfg.get(
             "valid_path", "data/madlad_multilang_clean_15k_optionB_kenlm/valid.txt"
         )
-    model_stem = Path(_CONFIG["model"]["binary"]).stem
-    output_path = (
-        input_path.parent / f"candidates_{args.split}_k{args.k}_{model_stem}.tsv"
-    )
+
+    if args.output is not None:
+        output_path = Path(args.output)
+    else:
+        model_stem = Path(_CONFIG["model"]["binary"]).stem
+        split_name = args.split or "custom"
+        output_path = (
+            input_path.parent / f"candidates_{split_name}_k{args.k}_{model_stem}.tsv"
+        )
 
     vocab_path = _REPO / data_cfg.get(
         "vocab_path", "data/madlad_multilang_clean_15k_optionB_kenlm/vocab.json"
@@ -188,9 +227,12 @@ def main() -> None:
     print(f"Input       : {input_path}")
     print(f"Output      : {output_path}")
     print(f"K           : {args.k}")
-    print(
-        f"Positions/line: {args.positions_per_line if args.positions_per_line else 'all'}"
-    )
+    if args.last_position_only:
+        print("Positions/line: last only")
+    else:
+        print(
+            f"Positions/line: {args.positions_per_line if args.positions_per_line else 'all'}"
+        )
     print(f"Workers     : {args.num_workers}")
 
     with vocab_path.open("r", encoding="utf-8") as f:
@@ -199,53 +241,82 @@ def main() -> None:
     vocab_tokens = [t for t in vocab_counts if t not in exclude]
     print(f"Scoreable vocab: {len(vocab_tokens)} tokens")
 
+    # Count lines first (cheap: only one line in memory at a time)
+    num_lines = 0
     with input_path.open("r", encoding="utf-8") as f:
-        lines = []
         for i, line in enumerate(f):
             if args.max_lines is not None and i >= args.max_lines:
                 break
-            line = line.strip()
-            if line:
-                lines.append(line.split())
+            if line.strip():
+                num_lines += 1
 
-    print(f"Sequences   : {len(lines)}")
-    print(f"Total positions: {sum(len(s) - 1 for s in lines):,}")
+    print(f"Sequences   : {num_lines}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = list(enumerate(lines))
-    initargs = (model_path, vocab_tokens, args.k, args.positions_per_line)
-    chunksize = max(8, len(tasks) // (args.num_workers * 4))
+    initargs = (
+        model_path,
+        vocab_tokens,
+        args.k,
+        args.positions_per_line,
+        args.last_position_only,
+    )
+
+    BATCH_SIZE = 1024  # lines read into memory at a time
 
     header = "seq_idx\tpos\tcandidates\tkenlm_scores\tgold\n"
     total_rows = 0
 
+    def _iter_batched_tasks():
+        """Yield (seq_idx, tokens) for each non-empty line, in batches of BATCH_SIZE."""
+        with input_path.open("r", encoding="utf-8") as f:
+            line_iter = itertools.islice(f, args.max_lines) if args.max_lines else f
+            seq_idx = 0
+            while True:
+                batch_lines = list(itertools.islice(line_iter, BATCH_SIZE))
+                if not batch_lines:
+                    return
+                batch: list[tuple[int, list[str]]] = []
+                for raw in batch_lines:
+                    raw = raw.strip()
+                    if raw:
+                        batch.append((seq_idx, raw.split()))
+                        seq_idx += 1
+                if batch:
+                    yield batch
+
     with output_path.open("w", encoding="utf-8") as out_f:
         out_f.write(header)
+        pbar = tqdm(total=num_lines, desc="lines", unit="lines")
 
         if args.num_workers <= 1:
             _worker_init(*initargs)
-            for task in tqdm(tasks, desc="lines", unit="lines"):
-                rows = _process_line(task)
-                if rows:
-                    out_f.write("\n".join(rows) + "\n")
-                total_rows += len(rows)
+            for batch in _iter_batched_tasks():
+                for task in batch:
+                    rows = _process_line(task)
+                    if rows:
+                        out_f.write("\n".join(rows) + "\n")
+                    total_rows += len(rows)
+                    pbar.update(1)
+                    pbar.set_postfix(rows=f"{total_rows:,}")
         else:
             with Pool(
                 processes=args.num_workers,
                 initializer=_worker_init,
                 initargs=initargs,
             ) as pool:
-                pbar = tqdm(total=len(tasks), desc="lines", unit="lines")
-                for rows in pool.imap_unordered(
-                    _process_line, tasks, chunksize=chunksize
-                ):
-                    if rows:
-                        out_f.write("\n".join(rows) + "\n")
-                    total_rows += len(rows)
-                    pbar.update(1)
-                    pbar.set_postfix(rows=f"{total_rows:,}")
-                pbar.close()
+                for batch in _iter_batched_tasks():
+                    chunksize = max(8, len(batch) // (args.num_workers * 4))
+                    for rows in pool.imap_unordered(
+                        _process_line, batch, chunksize=chunksize
+                    ):
+                        if rows:
+                            out_f.write("\n".join(rows) + "\n")
+                        total_rows += len(rows)
+                        pbar.update(1)
+                        pbar.set_postfix(rows=f"{total_rows:,}")
+
+        pbar.close()
 
     print(f"Done. {total_rows:,} rows written to {output_path}")
 
