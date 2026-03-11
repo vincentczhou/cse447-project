@@ -16,8 +16,11 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
+
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from utils.text_utils import normalize_text, char_tokenize
@@ -47,32 +50,32 @@ def main():
     )
     args = parser.parse_args()
 
-    train_lines = load_lines(args.train)
-    print(f"Train lines  : {len(train_lines)}")
-
-    ext_lines: list[str] = []
-    for ext_path in args.ext:
-        raw_lines = load_lines(ext_path)
-        tokenized = [
-            char_tokenize(normalize_text(line))
-            for line in raw_lines
-            if normalize_text(line)
-        ]
-        ext_lines.extend(tokenized * args.repeat)
-        print(
-            f"  + {ext_path}: {len(tokenized)} lines × {args.repeat} = {len(tokenized) * args.repeat}"
-        )
-
+    train_path = Path(args.train)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        for line in train_lines:
-            f.write(line + "\n")
-        for line in ext_lines:
-            f.write(line + "\n")
 
-    total = len(train_lines) + len(ext_lines)
-    print(f"\nTotal lines  : {total} → {args.output}")
+    # Copy train file directly instead of reading into memory
+    shutil.copy2(train_path, out)
+    print(f"Copied train : {train_path}")
+
+    ext_count = 0
+    with out.open("a", encoding="utf-8") as f:
+        for ext_path in args.ext:
+            raw_lines = load_lines(ext_path)
+            tokenized = [
+                char_tokenize(normalize_text(line))
+                for line in tqdm(raw_lines, desc=f"Tokenizing {ext_path}")
+                if normalize_text(line)
+            ]
+            for _ in range(args.repeat):
+                for line in tokenized:
+                    f.write(line + "\n")
+            ext_count += len(tokenized) * args.repeat
+            print(
+                f"  + {ext_path}: {len(tokenized)} lines × {args.repeat} = {len(tokenized) * args.repeat}"
+            )
+
+    print(f"\nExt lines added: {ext_count} → {args.output}")
 
 
 if __name__ == "__main__":
