@@ -15,8 +15,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-import multiprocessing
-import os
 import random
 from dataclasses import dataclass
 from functools import partial
@@ -47,11 +45,8 @@ UNK_ID = 1
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 # ---------------------------------------------------------------------------
-# Multiprocessing helpers for data loading (module-level for pickling)
+# Chunked data-loading helpers
 # ---------------------------------------------------------------------------
-
-_mp_stoi: dict[str, int] = {}
-_mp_n_sequences: int = 0
 
 LOAD_CHUNK_SIZE = 10_000  # lines per chunk for streaming file reads
 
@@ -65,16 +60,12 @@ def _iter_line_chunks(f, chunk_size: int = LOAD_CHUNK_SIZE):
         yield chunk
 
 
-def _mp_init(stoi: dict[str, int], n_sequences: int = 0) -> None:
-    """Worker initializer — sets globals so stoi is pickled once per worker."""
-    global _mp_stoi, _mp_n_sequences
-    _mp_stoi = stoi
-    _mp_n_sequences = n_sequences
-
-
-def _mp_parse_tsv_chunk(
+def _parse_tsv_chunk(
     lines: list[str],
+    stoi: dict[str, int],
+    n_sequences: int,
 ) -> list[tuple[int, int, list[int], list[float], int]]:
+    """Parse a chunk of precomputed-candidate TSV lines."""
     examples = []
     for line in lines:
         seq_idx_s, pos_s, cands_s, scores_s, gold = line.rstrip("\n").split(
@@ -82,16 +73,14 @@ def _mp_parse_tsv_chunk(
         )
         seq_idx = int(seq_idx_s)
         # Guard: TSV may cover more lines than were loaded (e.g. max_train_lines)
-        if seq_idx >= _mp_n_sequences:
+        if seq_idx >= n_sequences:
             continue
         cand_tokens = cands_s.split("\x01")
-        cand_ids = [_mp_stoi.get(t, UNK_ID) for t in cand_tokens]
+        cand_ids = [stoi.get(t, UNK_ID) for t in cand_tokens]
         kenlm_scores = [float(s) for s in scores_s.split("\x01")]
         try:
             label = cand_tokens.index(gold)
         except ValueError:
-            # Shouldn't happen — gold is force-included during precomputation.
-            # If it does, the TSV is corrupt or the vocab mapping is wrong.
             print(
                 f"WARNING: gold token {gold!r} not found in candidates at "
                 f"seq_idx={seq_idx_s}, pos={pos_s}. Defaulting label to 0."
@@ -101,18 +90,17 @@ def _mp_parse_tsv_chunk(
     return examples
 
 
-def _mp_parse_seq_chunk(lines: list[str]) -> list[list[int]]:
+def _parse_seq_chunk(lines: list[str], stoi: dict[str, int]) -> list[list[int]]:
     """Parse a chunk of tokenized text lines into lists of token IDs.
 
     Returns only sequences with >=2 tokens (need >=1 context + 1 target).
-    Tensors are created in the main process to avoid pickling overhead.
     """
     sequences: list[list[int]] = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        ids = [_mp_stoi.get(tok, UNK_ID) for tok in line.split()]
+        ids = [stoi.get(tok, UNK_ID) for tok in line.split()]
         if len(ids) >= 2:
             sequences.append(ids)
     return sequences
@@ -342,33 +330,20 @@ def load_sequences(
     path: Path,
     stoi: dict[str, int],
     max_lines: int | None = None,
-    num_workers: int = 0,
 ) -> list[torch.Tensor]:
     """Load tokenized text file into a list of 1-D LongTensors.
 
     Streams the file lazily in chunks to avoid loading it all into memory.
     """
-    n_workers = num_workers or os.cpu_count() or 1
-
-    # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
-    # Initializer sends stoi once per worker instead of once per chunk.
-    ctx = multiprocessing.get_context("forkserver")
-    # Workers return list[list[int]]; tensors are created here to avoid pickle overhead
     sequences: list[torch.Tensor] = []
     with path.open("r", encoding="utf-8") as f:
         line_iter = islice(f, max_lines) if max_lines is not None else f
-        pool = ctx.Pool(n_workers, initializer=_mp_init, initargs=(stoi,))
-        try:
-            for chunk_result in tqdm(
-                pool.imap(_mp_parse_seq_chunk, _iter_line_chunks(line_iter)),
-                desc=f"Loading {path.name}",
-            ):
-                sequences.extend(
-                    torch.tensor(ids, dtype=torch.long) for ids in chunk_result
-                )
-        finally:
-            pool.close()
-            pool.join()
+        for chunk in tqdm(
+            _iter_line_chunks(line_iter),
+            desc=f"Loading {path.name}",
+        ):
+            for ids in _parse_seq_chunk(chunk, stoi):
+                sequences.append(torch.tensor(ids, dtype=torch.long))
     return sequences
 
 
@@ -663,31 +638,19 @@ class PrecomputedRerankerDataset(torch.utils.data.Dataset):
         stoi: dict[str, int],
         max_context_len: int,
         max_examples: int | None = None,
-        num_workers: int = 0,
     ):
         self.sequences = sequences
         self.max_context_len = max_context_len
 
-        n_workers = num_workers or os.cpu_count() or 1
-
-        # Use forkserver to avoid inheriting PyTorch's thread pools via fork.
-        # Initializer sends stoi + n_sequences once per worker instead of once per chunk.
-        ctx = multiprocessing.get_context("forkserver")
+        n_sequences = len(sequences)
         examples: list[tuple[int, int, list[int], list[float], int]] = []
         with tsv_path.open("r", encoding="utf-8") as f:
             next(f)  # skip header
-            pool = ctx.Pool(
-                n_workers, initializer=_mp_init, initargs=(stoi, len(sequences))
-            )
-            try:
-                for chunk_result in tqdm(
-                    pool.imap(_mp_parse_tsv_chunk, _iter_line_chunks(f)),
-                    desc=f"Loading {tsv_path.name}",
-                ):
-                    examples.extend(chunk_result)
-            finally:
-                pool.close()
-                pool.join()
+            for chunk in tqdm(
+                _iter_line_chunks(f),
+                desc=f"Loading {tsv_path.name}",
+            ):
+                examples.extend(_parse_tsv_chunk(chunk, stoi, n_sequences))
 
         if max_examples is not None and len(examples) > max_examples:
             random.shuffle(examples)
@@ -949,14 +912,12 @@ def main() -> None:
         Path(train_cfg.train_path),
         stoi,
         train_cfg.max_train_lines,
-        num_workers=train_cfg.num_workers,
     )
     print(f"Loading sequences from {train_cfg.valid_path}")
     valid_seqs = load_sequences(
         Path(train_cfg.valid_path),
         stoi,
         train_cfg.max_valid_lines,
-        num_workers=train_cfg.num_workers,
     )
     print(f"Train: {len(train_seqs)} sequences, Valid: {len(valid_seqs)} sequences")
 
@@ -989,7 +950,6 @@ def main() -> None:
             stoi,
             model_cfg.max_context_len,
             train_cfg.max_train_examples,
-            num_workers=train_cfg.num_workers,
         )
         print(f"Loading valid candidates from {cand_valid}")
         valid_ds = PrecomputedRerankerDataset(
@@ -998,7 +958,6 @@ def main() -> None:
             stoi,
             model_cfg.max_context_len,
             train_cfg.max_valid_examples,
-            num_workers=train_cfg.num_workers,
         )
         collate_fn = partial(collate_precomputed, pad_id=model_cfg.pad_id)
     else:
