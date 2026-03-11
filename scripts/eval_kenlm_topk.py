@@ -9,14 +9,14 @@ Use scripts/grade.py to evaluate accuracy at any cutoff.
 Usage:
     uv run python scripts/eval_kenlm_topk.py test \
         --work_dir work \
-        --test_data data/madlad_multilang_clean_15k_optionB_kenlm/input_valid.txt \
-        --test_output work/preds_char6_top64.txt \
+        --test_data data/madlad_multilang_clean_35k_optionB_kenlm/input_valid.txt \
+        --test_output output/preds_char6_top64.txt \
         --k 64
 
     # Then grade at top-3:
     uv run python scripts/grade.py \
-        --pred work/preds_char6_top64.txt \
-        --answer data/madlad_multilang_clean_15k_optionB_kenlm/answer_valid.txt \
+        --pred output/preds_char6_top64.txt \
+        --answer data/madlad_multilang_clean_35k_optionB_kenlm/answer_valid.txt \
         --top-k 3
 """
 

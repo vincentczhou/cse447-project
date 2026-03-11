@@ -8,17 +8,17 @@ characters (caseless). Defaults to top-3 to match the original task spec.
 
 Usage:
     # Single cutoff, one model
-    python scripts/grade.py \
-        --pred   work/preds_char6_top64.txt \
-        --answer data/madlad_multilang_clean_15k_optionB_kenlm/answer_valid.txt \
+    uv run python scripts/grade.py \
+        --pred   output/preds_char6_top64.txt \
+        --answer data/madlad_multilang_clean_35k_optionB_kenlm/answer_valid.txt \
         --top-k  3
 
     # Sweep K=1..64, compare models, save TSV
-    python scripts/grade.py \
-        --pred   work/preds_char5_top64.txt work/preds_char6_top64.txt \
+    uv run python scripts/grade.py \
+        --pred   output/preds_char5_top64.txt output/preds_char6_top64.txt \
         --names  char5 char6 \
-        --answer data/madlad_multilang_clean_15k_optionB_kenlm/answer_valid.txt \
-        --sweep  --sweep-output work/sweep.tsv
+        --answer data/madlad_multilang_clean_35k_optionB_kenlm/answer_valid.txt \
+        --sweep  --sweep-output output/sweep.tsv
 
     # Verbose per-line output at a single cutoff
     python scripts/grade.py \

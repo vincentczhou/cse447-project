@@ -6,11 +6,11 @@ Each line from each --ext file is normalized and char-tokenized (matching
 the format preprocess.py uses) before being written --repeat times.
 
 Usage:
-    python scripts/augment_train.py \
+    uv run python scripts/augment_train.py \
         --train  data/.../train.txt \
-        --ext    output/test_input_ext1.txt \
-                 output/test_input_ext2.txt \
-                 output/test_input_ext3.txt \
+        --ext    work/distill_input_ext1.txt \
+                 work/distill_input_ext2.txt \
+                 work/distill_input_ext3.txt \
         --output data/.../train_augmented.txt \
         --repeat 5
 """
