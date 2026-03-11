@@ -156,6 +156,9 @@ class TrainConfig:
     out_dir: str = "work"
     checkpoint_name: str = "reranker.pt"
     resume_from: str | None = None
+    init_weights_from: str | None = (
+        None  # Load weights only (no optimizer/scheduler); uses .pt inference checkpoint
+    )
 
     # Training
     epochs: int = 10
@@ -194,10 +197,14 @@ class TrainConfig:
     every_n_train_steps: int | None = None
     save_on_train_epoch_end: bool | None = None
 
+    # Validation frequency (int = every N optimizer steps, 1.0 = every epoch)
+    val_check_interval: int | float | None = None
+
     # Misc
     seed: int = 42
     log_every: int = 100
     num_workers: int = 2
+    pin_memory: bool = True
     cpu: bool = False
 
 
@@ -247,6 +254,7 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         out_dir=out.get("out_dir", train_cfg.out_dir),
         checkpoint_name=out.get("checkpoint_name", train_cfg.checkpoint_name),
         resume_from=out.get("resume_from", train_cfg.resume_from),
+        init_weights_from=out.get("init_weights_from", train_cfg.init_weights_from),
         epochs=tr.get("epochs", train_cfg.epochs),
         batch_size=tr.get("batch_size", train_cfg.batch_size),
         eval_batch_size=tr.get("eval_batch_size", train_cfg.eval_batch_size),
@@ -284,12 +292,14 @@ def _load_config_from_yaml() -> tuple[RerankerConfig, TrainConfig]:
         wandb_run_name=wandb_cfg.get("run_name", train_cfg.wandb_run_name),
         log_every=log.get("log_every", train_cfg.log_every),
         num_workers=log.get("num_workers", train_cfg.num_workers),
+        pin_memory=log.get("pin_memory", train_cfg.pin_memory),
         every_n_train_steps=out.get(
             "every_n_train_steps", train_cfg.every_n_train_steps
         ),
         save_on_train_epoch_end=out.get(
             "save_on_train_epoch_end", train_cfg.save_on_train_epoch_end
         ),
+        val_check_interval=tr.get("val_check_interval", train_cfg.val_check_interval),
     )
 
     return model_cfg, train_cfg
@@ -759,11 +769,37 @@ class RerankerLightningModule(L.LightningModule):
         self.save_hyperparameters(ignore=["unigram_probs", "tokens"])
         self.model_cfg = RerankerConfig(**model_cfg_dict)
         self.train_cfg = TrainConfig(**train_cfg_dict)
-        self.model = torch.compile(Reranker(self.model_cfg))
+        self.model = Reranker(self.model_cfg)
         self.tokens = tokens
         # register_buffer saves unigram_probs with the checkpoint without
         # treating it as a trainable parameter.
         self.register_buffer("unigram_probs", unigram_probs)
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Strip _orig_mod. prefix from state_dict keys so checkpoints saved
+        with torch.compile can be loaded into an uncompiled model (and vice versa)."""
+        state = checkpoint.get("state_dict", {})
+        fixed = {}
+        needs_fix = False
+        has_orig = any("_orig_mod." in k for k in state)
+        model_compiled = (
+            isinstance(self.model, torch._dynamo.eval_frame.OptimizedModule)
+            if hasattr(torch, "_dynamo")
+            else False
+        )
+        if has_orig and not model_compiled:
+            needs_fix = True
+            for k, v in state.items():
+                fixed[k.replace("._orig_mod", "")] = v
+        elif not has_orig and model_compiled:
+            needs_fix = True
+            for k, v in state.items():
+                if k.startswith("model."):
+                    fixed["model._orig_mod." + k[len("model.") :]] = v
+                else:
+                    fixed[k] = v
+        if needs_fix:
+            checkpoint["state_dict"] = fixed
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         context_ids, candidate_ids, kenlm_scores, labels = batch
@@ -871,6 +907,24 @@ def load_for_inference(
     return model, tokens, stoi
 
 
+def load_weights_for_finetuning(
+    lit_model: "RerankerLightningModule", path: str
+) -> None:
+    """Load model weights from an inference checkpoint (.pt) into a LitReranker.
+
+    Only loads model parameters — optimizer and scheduler state are left fresh
+    so that new hyperparameters (lr, warmup, etc.) take effect from step 0.
+    Weights are loaded to CPU first; Lightning moves them to GPU during trainer.fit().
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model_state_dict"]
+    # Strip _orig_mod. prefix if present (from torch.compile checkpoints)
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    lit_model.model.load_state_dict(state_dict)
+    print(f"Loaded weights from {path} (fresh optimizer/scheduler)")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -971,7 +1025,7 @@ def main() -> None:
         shuffle=True,
         num_workers=train_cfg.num_workers,
         collate_fn=collate_fn,
-        pin_memory=use_gpu,
+        pin_memory=train_cfg.pin_memory and use_gpu,
         drop_last=True,
     )
     valid_loader = torch.utils.data.DataLoader(
@@ -980,7 +1034,7 @@ def main() -> None:
         shuffle=False,
         num_workers=train_cfg.num_workers,
         collate_fn=collate_fn,
-        pin_memory=use_gpu,
+        pin_memory=train_cfg.pin_memory and use_gpu,
     )
 
     # ---- Lightning module ----
@@ -990,6 +1044,9 @@ def main() -> None:
         tokens,
         unigram_probs,
     )
+    if train_cfg.init_weights_from:
+        load_weights_for_finetuning(lit_model, train_cfg.init_weights_from)
+
     param_count = sum(p.numel() for p in lit_model.model.parameters())
     print(f"Model parameters: {param_count:,}")
 
@@ -1040,16 +1097,19 @@ def main() -> None:
         default_root_dir=str(out_dir),
         accelerator="gpu" if use_gpu else "cpu",
         devices="auto",
-        strategy="ddp",
+        strategy="auto",
         limit_val_batches=train_cfg.max_eval_batches or 1.0,
+        val_check_interval=train_cfg.val_check_interval,
     )
 
     try:
         trainer.fit(
             lit_model, train_loader, valid_loader, ckpt_path=train_cfg.resume_from
         )
-    except KeyboardInterrupt:
-        print("\nInterrupted — saving checkpoint with current weights...")
+    except (KeyboardInterrupt, SystemExit):
+        print("\nInterrupted — saving inference checkpoint...")
+    finally:
+        pass
 
     # ---- Export plain inference checkpoint (no Lightning needed at runtime) ----
     inference_path = out_dir / train_cfg.checkpoint_name
