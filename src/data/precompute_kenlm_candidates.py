@@ -16,8 +16,20 @@ Output columns:
     gold          str   - the correct next token
 
 Usage:
-    uv run python src/data/precompute_kenlm_candidates.py --split train --work_dir work --k 64
-    uv run python src/data/precompute_kenlm_candidates.py --split valid --work_dir work --k 64
+    uv run python src/data/precompute_kenlm_candidates.py --split train
+    uv run python src/data/precompute_kenlm_candidates.py --split valid
+    uv run python src/data/precompute_kenlm_candidates.py --input custom.txt --output out.tsv
+
+Arguments:
+    --split {train,valid}     Use train/valid path from config.yaml (required unless --input given)
+    --input PATH              Custom input file; overrides --split
+    --output PATH             Custom output TSV path (default: auto-named next to input)
+    --work_dir DIR            Directory containing the KenLM binary and vocab (default: work)
+    --k INT                   Number of top-K candidates per position (default: 64)
+    --max_lines INT           Limit number of input lines, for testing (default: all)
+    --positions_per_line INT  Randomly sample this many positions per line (default: all)
+    --last_position_only      Only emit the last position per line, for distillation
+    --num_workers INT         Worker processes for scoring (default: cpu_count)
 """
 
 from __future__ import annotations

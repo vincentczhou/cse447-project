@@ -12,6 +12,8 @@ Usage:
         --test_data data/madlad_multilang_clean_35k_optionB_kenlm/input_valid.txt \
         --test_output output/preds_char6_top64.txt \
         --k 64
+        # --model 35k_char6_000122.binary  # optional – overrides config.yaml
+        # --vocab 35k_vocab_truncated.json # optional – overrides config.yaml
 
     # Then grade at top-3:
     uv run python scripts/grade.py \

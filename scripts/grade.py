@@ -21,7 +21,7 @@ Usage:
         --sweep  --sweep-output output/sweep.tsv
 
     # Verbose per-line output at a single cutoff
-    python scripts/grade.py \
+    uv run python scripts/grade.py \
         --pred   output/gemini_pred.txt \
         --answer example/answer.txt \
         --top-k  3 --verbose

@@ -111,7 +111,7 @@ Converts a Lightning `.ckpt` checkpoint to a plain inference `.pt` file containi
 
 ### `gemini_predictor.py`
 
-Calls the Gemini API to predict the three most likely next characters for each input string. Supports async concurrency, exponential-backoff retries, a persistent prediction cache, and optional `--eval-only` mode to grade an existing predictions file without making API calls.
+Calls the Gemini API to predict the three most likely next characters for each input string. Reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the environment or `.env` file (or pass `--api-key`). Supports async concurrency (`--concurrency`, default 150), exponential-backoff retries, a persistent prediction cache, `--sample N` to randomly subset inputs, and `--eval-only` to grade an existing predictions file without making API calls.
 
 ### `extend_inputs.py`
 

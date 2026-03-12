@@ -9,6 +9,7 @@ Falls back to KenLM-only if reranker checkpoint is missing.
 
 Usage:
     uv run python src/predict.py --work_dir work --test_data example/input.txt --test_output pred.txt
+        [--device cpu|cuda] [--kenlm-only]
 """
 
 from __future__ import annotations
@@ -334,6 +335,7 @@ class TwoStagePredictor:
     @classmethod
     def write_pred(cls, preds: list[str], fname: str) -> None:
         """Write predictions file (one prediction per line)."""
+        Path(fname).parent.mkdir(parents=True, exist_ok=True)
         with open(fname, "wt") as f:
             for p in preds:
                 f.write(f"{p}\n")
