@@ -1,6 +1,13 @@
+"""Preprocess a HuggingFace dataset into character-tokenized files for KenLM.
+
+Loads the dataset built by builddataset.py, normalizes text (NFC, lowercase,
+whitespace collapse), tokenizes to character level (spaces -> <sp>), splits
+into train/valid, and writes tokenized .txt files plus a vocabulary JSON.
+"""
+
 import sys
 from collections import Counter
-from datasets import Dataset
+from datasets import load_dataset
 import json
 from pathlib import Path
 import random
@@ -29,7 +36,8 @@ INPUT_DIR = DATA_DIR / pre_cfg["input_dir"]
 OUTPUT_DIR = DATA_DIR / pre_cfg["output_dir"]
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-ds = Dataset.load_from_disk(str(INPUT_DIR))
+parquet_files = sorted(str(p) for p in (INPUT_DIR / "parts").glob("part-*.parquet"))
+ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
 rng = random.Random(SEED)
 
 train_path = OUTPUT_DIR / "train.txt"

@@ -7,13 +7,22 @@ SPACE_TOKEN = "<sp>"
 _ws_re = re.compile(r"\s+")
 
 
-def normalize_text(text: str) -> str:
-    """Normalize text: fix escaped whitespace, NFC normalize, lowercase, collapse whitespace."""
+def normalize_text(text: str, preserve_trailing_space: bool = False) -> str:
+    """Normalize text: fix escaped whitespace, NFC normalize, lowercase, collapse whitespace.
+
+    By default, leading and trailing whitespace are stripped. When
+    ``preserve_trailing_space`` is True, one meaningful trailing space is
+    retained after whitespace collapsing. This is useful for distillation
+    examples where the predicted next character may itself be a space.
+    """
     text = text.replace("\\n", " ").replace("\\t", " ").replace("\\r", " ")
     text = unicodedata.normalize("NFC", text)
     text = text.lower()
-    text = _ws_re.sub(" ", text).strip()
-    return text
+    has_trailing_space = preserve_trailing_space and bool(text) and text[-1].isspace()
+    text = _ws_re.sub(" ", text)
+    if has_trailing_space:
+        return text.lstrip().rstrip() + " "
+    return text.strip()
 
 
 def char_tokenize(text: str) -> str:

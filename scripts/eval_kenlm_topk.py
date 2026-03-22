@@ -1,7 +1,31 @@
 #!/usr/bin/env python
+"""
+Generate KenLM top-K predictions for a set of input prefixes.
+
+Outputs one prediction string per line — the top-K most likely next characters
+concatenated in confidence order (e.g. "etaio..." for K=5).
+Use scripts/grade.py to evaluate accuracy at any cutoff.
+
+Usage:
+    uv run python scripts/eval_kenlm_topk.py test \
+        --work_dir work \
+        --test_data data/madlad_multilang_clean_35k_optionB_kenlm/input_valid.txt \
+        --test_output output/preds_char6_top64.txt \
+        --k 64
+        # --model 35k_char6_000122.binary  # optional – overrides config.yaml
+        # --vocab 35k_vocab_truncated.json # optional – overrides config.yaml
+
+    # Then grade at top-3:
+    uv run python scripts/grade.py \
+        --pred output/preds_char6_top64.txt \
+        --answer data/madlad_multilang_clean_35k_optionB_kenlm/answer_valid.txt \
+        --top-k 3
+"""
+
 import heapq
 import json
 import os
+import sys
 import traceback
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from multiprocessing import Pool, cpu_count
@@ -10,7 +34,10 @@ from pathlib import Path
 import kenlm
 import yaml
 
-from utils.text_utils import SPACE_TOKEN, input_to_tokens
+# Resolve src/ so utils.text_utils can be imported when running from scripts/
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO / "src"))
+from utils.text_utils import SPACE_TOKEN, input_to_tokens  # noqa: E402
 
 # Load config
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -18,27 +45,30 @@ with _CONFIG_PATH.open("r", encoding="utf-8") as _f:
     CONFIG = yaml.safe_load(_f)
 
 FALLBACK_PRED = CONFIG["prediction"]["fallback"]
-TOP_K = CONFIG["prediction"]["top_k"]
+_DEFAULT_K = CONFIG["prediction"]["top_k"]
 MODEL_BINARY = CONFIG["model"]["binary"]
 VOCAB_FILE = CONFIG["model"]["vocab"]
 EXCLUDE_TOKENS = set(CONFIG["model"]["exclude_tokens"])
 MAX_WORKERS = CONFIG["workers"]["max_workers"]
 SEQUENTIAL_THRESHOLD = CONFIG["workers"]["sequential_threshold"]
 CHUNK_DIVISOR = CONFIG["workers"]["chunk_divisor"]
+
 # Global variables for worker processes (each worker loads its own model)
 _worker_model = None
 _worker_vocab = None
+_worker_k = None
 
 
-def _worker_init(model_path: str, vocab: list[str]):
+def _worker_init(model_path: str, vocab: list[str], k: int):
     """Initialize KenLM model in each worker process."""
-    global _worker_model, _worker_vocab
+    global _worker_model, _worker_vocab, _worker_k
     _worker_model = kenlm.Model(model_path)
     _worker_vocab = vocab
+    _worker_k = k
 
 
 def _predict_single(inp: str) -> str:
-    """Predict top 3 next characters for a single input. Runs in worker process."""
+    """Predict top k next characters for a single input. Runs in worker process."""
     try:
         tokens = input_to_tokens(inp)
 
@@ -58,11 +88,11 @@ def _predict_single(inp: str) -> str:
             scored.append((log_prob, token))
 
         # Get top k by log probability
-        top3 = heapq.nlargest(TOP_K, scored, key=lambda x: x[0])
+        topk = heapq.nlargest(_worker_k, scored, key=lambda x: x[0])
 
         # Convert tokens back to characters
         chars = []
-        for _, token in top3:
+        for _, token in topk:
             if token == SPACE_TOKEN:
                 chars.append(" ")
             else:
@@ -86,11 +116,12 @@ class MyModel:
 
     @classmethod
     def load_training_data(cls):
-        # KenLM training is done offline with lmplz
+        """No-op — KenLM training is done offline with lmplz."""
         return []
 
     @classmethod
     def load_test_data(cls, fname):
+        """Load test data from file, one input per line."""
         data = []
         with open(fname) as f:
             for line in f:
@@ -100,23 +131,26 @@ class MyModel:
 
     @classmethod
     def write_pred(cls, preds, fname):
+        """Write predictions file, one prediction per line."""
+        Path(fname).parent.mkdir(parents=True, exist_ok=True)
         with open(fname, "wt") as f:
             for p in preds:
                 f.write("{}\n".format(p))
 
     def run_train(self, data, work_dir):
-        # KenLM training is done offline with lmplz
+        """No-op — KenLM training is done offline with lmplz."""
         pass
 
-    def run_pred(self, data):
+    def run_pred(self, data, k: int = _DEFAULT_K):
         """Predict top k next characters for each input."""
         num_workers = min(cpu_count(), MAX_WORKERS)
 
         if len(data) < SEQUENTIAL_THRESHOLD or num_workers <= 1:
             # Sequential for small datasets
-            global _worker_model, _worker_vocab
+            global _worker_model, _worker_vocab, _worker_k
             _worker_model = self.model
             _worker_vocab = self.vocab
+            _worker_k = k
             return [_predict_single(inp) for inp in data]
 
         # Parallel for large datasets
@@ -126,7 +160,7 @@ class MyModel:
             with Pool(
                 processes=num_workers,
                 initializer=_worker_init,
-                initargs=(self.model_path, self.vocab),
+                initargs=(self.model_path, self.vocab, k),
             ) as pool:
                 preds = pool.map(_predict_single, data, chunksize=chunk_size)
             return preds
@@ -134,21 +168,21 @@ class MyModel:
             print(f"Warning: multiprocessing failed ({e}), falling back to sequential")
             _worker_model = self.model
             _worker_vocab = self.vocab
+            _worker_k = k
             return [_predict_single(inp) for inp in data]
 
     def save(self, work_dir):
-        # your code here
-        # this particular model has nothing to save, but for demonstration purposes we will save a blank file
+        """Save a dummy checkpoint file (KenLM model is the binary itself)."""
         with open(os.path.join(work_dir, "model.checkpoint"), "wt") as f:
             f.write("dummy save")
 
     @classmethod
-    def load(cls, work_dir):
+    def load(cls, work_dir, model_binary=MODEL_BINARY, vocab_file=VOCAB_FILE):
         """Load KenLM binary model and vocabulary."""
         instance = cls()
 
         # Load KenLM model
-        model_path = os.path.join(work_dir, MODEL_BINARY)
+        model_path = os.path.join(work_dir, model_binary)
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"KenLM model not found at {model_path}")
         print(f"Loading KenLM model from {model_path}")
@@ -156,7 +190,7 @@ class MyModel:
         instance.model = kenlm.Model(model_path)
 
         # Load vocabulary
-        vocab_path = os.path.join(work_dir, VOCAB_FILE)
+        vocab_path = os.path.join(work_dir, vocab_file)
         if not os.path.exists(vocab_path):
             raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
         print(f"Loading vocabulary from {vocab_path}")
@@ -179,6 +213,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test_output", help="path to write test predictions", default="pred.txt"
     )
+    parser.add_argument(
+        "--k", type=int, default=_DEFAULT_K, help="number of top predictions to output"
+    )
+    parser.add_argument(
+        "--model",
+        default=MODEL_BINARY,
+        help="KenLM binary filename (relative to work_dir)",
+    )
+    parser.add_argument(
+        "--vocab", default=VOCAB_FILE, help="vocab JSON filename (relative to work_dir)"
+    )
     args = parser.parse_args()
 
     if args.mode == "train":
@@ -196,11 +241,13 @@ if __name__ == "__main__":
     elif args.mode == "test":
         try:
             print("Loading model")
-            model = MyModel.load(args.work_dir)
+            model = MyModel.load(
+                args.work_dir, model_binary=args.model, vocab_file=args.vocab
+            )
             print("Loading test data from {}".format(args.test_data))
             test_data = MyModel.load_test_data(args.test_data)
             print("Making predictions")
-            pred = model.run_pred(test_data)
+            pred = model.run_pred(test_data, k=args.k)
             print("Writing predictions to {}".format(args.test_output))
             assert len(pred) == len(test_data), (
                 "Expected {} predictions but got {}".format(len(test_data), len(pred))

@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-# uv run python oov_test.py --model work/char6.binary --vocab work/vocab.json --token "@"
+"""Check whether a token is in the KenLM vocabulary and print its base score.
+
+Usage:
+    uv run python scripts/oov_test.py --model work/char6.binary --vocab work/vocab.json --token "@"
+"""
+
 import argparse
 import json
 import os
@@ -8,6 +13,7 @@ import kenlm
 
 
 def load_vocab(vocab_path: str) -> set[str]:
+    """Load vocabulary keys from a JSON file."""
     with open(vocab_path, "r", encoding="utf-8") as f:
         vocab_dict = json.load(f)
     return set(vocab_dict.keys())
