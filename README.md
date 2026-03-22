@@ -1,8 +1,8 @@
-# CSE 447 — Next-Character Prediction
+# AutoCharacter
 
-Two-stage character-level next-character prediction system for multilingual text. Given a partial string, predicts the three most likely next characters.
+Two-stage character-level next-character prediction system for multilingual text. Given a partial string, predicts the three most likely next characters (character autocomplete).
 
-See [SPECIFICATION.md](SPECIFICATION.md) for the original CSE 447 project specification.
+See [SPECIFICATION.md](SPECIFICATION.md) for the original [CSE 447 project](https://minneker.github.io/nlp-26wi/projects/447-project/) specification.
 
 **Stage 1 — KenLM**: An n-gram language model scores all vocabulary tokens and returns the top-K candidates.
 
