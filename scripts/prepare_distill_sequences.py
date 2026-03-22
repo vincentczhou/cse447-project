@@ -35,7 +35,9 @@ def main():
             count = 0
             with open(ext_path, encoding="utf-8") as ef:
                 for line in ef:
-                    text = normalize_text(line.rstrip("\n"))
+                    text = normalize_text(
+                        line.rstrip("\n"), preserve_trailing_space=True
+                    )
                     if text:
                         f.write(char_tokenize(text) + "\n")
                         count += 1

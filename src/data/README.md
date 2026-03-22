@@ -1,6 +1,6 @@
 # Data Pipeline
 
-This directory contains scripts for building and preprocessing multilingual datasets for character-level language modeling with KenLM.
+This directory contains scripts for building and preprocessing multilingual datasets for character-level language modeling with KenLM, and for precomputing reranker training candidates.
 
 ## Scripts Overview
 
@@ -9,7 +9,7 @@ This directory contains scripts for building and preprocessing multilingual data
 Downloads and builds a multilingual dataset from the MADLAD-400 corpus.
 
 **What it does:**
-- Streams text data from [allenai/madlad-400](https://huggingface.co/datasets/allenai/madlad-400) for 53 languages
+- Streams text data from [allenai/madlad-400](https://huggingface.co/datasets/allenai/madlad-400) for the languages listed in `data_config.yaml`
 - Collects 1,000 samples per language (configurable)
 - Filters texts by length (200-4,000 characters)
 - Saves as a Hugging Face Dataset format
@@ -41,13 +41,24 @@ Prepares the downloaded dataset for KenLM training by converting to character-le
   - `train.txt` - Training data (one tokenized line per document)
   - `valid.txt` - Validation data
 
-## Usage
+### `precompute_kenlm_candidates.py`
+
+Precomputes KenLM top-K candidates for every position (or last position only) in a tokenized text file. Used to generate hard negatives for reranker training. For each position, builds the KenLM context state, scores all vocab tokens, and takes the top-K. Supports stratified sampling across language groups and sibling gold exclusion.
+
+**Output:** TSV file with columns: `seq_idx`, `pos`, `candidates`, `kenlm_scores`, `gold` (candidates and scores are `\x01`-separated)
+
+### `precompute_random_candidates.py`
+
+Same TSV format as `precompute_kenlm_candidates.py`, but candidates are drawn uniformly at random (no KenLM scoring). All kenlm_scores are 0. Gold is always force-included. Useful as a baseline to isolate the reranker's contribution vs KenLM candidate quality.
+
+---
+
+## Workflows
 
 ### 1. Build the Dataset
 
 ```bash
-cd src/data
-uv run builddataset.py
+uv run python src/data/builddataset.py
 ```
 
 This will take some time as it streams data from Hugging Face. Progress is printed per language.
@@ -57,8 +68,7 @@ This will take some time as it streams data from Hugging Face. Progress is print
 ### 2. Preprocess for KenLM
 
 ```bash
-cd src/data
-uv run preprocess.py
+uv run python src/data/preprocess.py
 ```
 
 You'll see a progress bar showing processing status.
@@ -79,6 +89,40 @@ lmplz -o 5 < train.txt > model_5gram.arpa
 # Optionally, binarize for faster loading
 build_binary model_5gram.arpa model_5gram.bin
 ```
+
+### 4. Precompute KenLM Candidates for Reranker Training
+
+Generate hard-negative candidate TSVs for the reranker. These are referenced in `config.yaml` under `reranker.data.candidates_train_path` / `candidates_valid_path`.
+
+```bash
+# Full train set, all positions, K=64
+uv run python src/data/precompute_kenlm_candidates.py --split train --k 64
+
+# Last position only (for distillation data), with sibling gold exclusion
+uv run python src/data/precompute_kenlm_candidates.py \
+    --split train --k 64 --last_position_only --exclude_sibling_golds
+
+# Stratified sample of 35k lines across 52 languages
+uv run python src/data/precompute_kenlm_candidates.py \
+    --split train --k 64 --stratified_sample 35000
+
+# Limit to 5 random positions per line (reduces TSV size for large datasets)
+uv run python src/data/precompute_kenlm_candidates.py \
+    --split train --k 64 --positions_per_line 5
+
+# Valid set
+uv run python src/data/precompute_kenlm_candidates.py --split valid --k 64
+```
+
+### 5. (Optional) Precompute Random Candidates (Baseline)
+
+Generates a TSV with random candidates instead of KenLM top-K. Useful for ablations to isolate the reranker's contribution from KenLM candidate quality.
+
+```bash
+uv run python src/data/precompute_random_candidates.py --split train --k 64 --last_position_only
+```
+
+---
 
 ## Configuration
 

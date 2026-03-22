@@ -19,6 +19,7 @@ from pathlib import Path
 
 
 def load_lines(path: str) -> list[str]:
+    """Read a text file, returning one string per line (newlines stripped)."""
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
 

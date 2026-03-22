@@ -5,9 +5,10 @@ submit/
 submit.zip
 
 # Added
-/data/
 .env
-wandb/
-*.zip
 *.arpa
 *.binary
+*.zip
+/data/
+temp/
+wandb/

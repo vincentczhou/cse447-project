@@ -14,10 +14,11 @@ import yaml
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
-from train_reranker import RerankerLightningModule, load_vocab  # noqa: E402
+from reranker import RerankerLightningModule, load_vocab  # noqa: E402
 
 
 def convert(ckpt_path: Path, out_path: Path, vocab_path: Path) -> None:
+    """Load a Lightning checkpoint and save a plain inference .pt file."""
     print(f"Loading {ckpt_path}")
     tokens, unigram_probs = load_vocab(vocab_path)
     lit_model = RerankerLightningModule.load_from_checkpoint(

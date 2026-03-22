@@ -1,27 +1,59 @@
-# Notes (Spec Below)
+# CSE 447 — Next-Character Prediction
+
+Two-stage character-level next-character prediction system for multilingual text. Given a partial string, predicts the three most likely next characters.
+
+See [SPECIFICATION.md](SPECIFICATION.md) for the original CSE 447 project specification.
+
+**Stage 1 — KenLM**: An n-gram language model scores all vocabulary tokens and returns the top-K candidates.
+
+**Stage 2 — Reranker**: A causal Transformer rescores the K candidates using learned context encoding, blended with KenLM scores via a mixture model. Falls back to KenLM-only if no reranker checkpoint is present.
+
+## Project Structure
+
+```
+config.yaml              # All inference + reranker training hyperparameters
+data_config.yaml         # Dataset download + preprocessing settings
+src/
+  predict.py             # Two-stage inference (KenLM + reranker)
+  predict.sh             # Shell wrapper for predict.py
+  myprogram.py           # KenLM-only baseline inference (used for previous checkpoints, unused)
+  reranker/              # Reranker package (model, training, data loading)
+  data/                  # Dataset building + candidate precomputation
+  utils/                 # Shared text preprocessing utilities
+scripts/                 # Evaluation, grading, distillation, plotting
+work/                    # Model binaries + checkpoints (not included)
+```
+
+See [src/reranker/README.md](src/reranker/README.md), [src/data/README.md](src/data/README.md), and [scripts/README.md](scripts/README.md) for detailed documentation.
 
 ## Setup
 
-Install [KenLM](https://github.com/kpu/kenlm), then:
+### Prerequisites
+
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) package manager
+- [KenLM](https://github.com/kpu/kenlm) (for `lmplz` and `build_binary` commands)
+
+### Install
 
 ```bash
 uv sync
 uv run pre-commit install
 ```
 
----
+KenLM is installed as a Python package from source via uv (see `pyproject.toml`). For the CLI tools (`lmplz`, `build_binary`), follow the [KenLM build instructions](https://github.com/kpu/kenlm#building).
+
+> **Note:** PyTorch and Lightning are listed as dev dependencies (not core dependencies). This is intentional — the Docker submission image (`pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime`) already has PyTorch pre-installed via system packages, so the submitted container uses that instead of pip-installing it. Install dev dependencies locally with `uv sync` (which includes `--dev` by default).
 
 ## Full Pipeline
 
 ### 1. Download and build the dataset
 
-Settings (languages, samples per language, etc.) live in [`data_config.yaml`](data_config.yaml) under `builddataset`.
+Settings (languages, samples per language, etc.) live in [`data_config.yaml`](data_config.yaml).
 
 ```bash
 uv run python src/data/builddataset.py
 ```
-
-Output: `data/madlad_multilang_clean_30k_optionB/`
 
 ### 2. Preprocess for KenLM (character tokenization)
 
@@ -31,215 +63,91 @@ Settings live in [`data_config.yaml`](data_config.yaml) under `preprocess`.
 uv run python src/data/preprocess.py
 ```
 
-Output: `data/madlad_multilang_clean_30k_optionB_kenlm/` with `train.txt`, `valid.txt`, `vocab.json`, `input_valid.txt`, `answer_valid.txt`.
+Output: `data/<output_dir>/` with `train.txt`, `valid.txt`, `vocab.json`, `input_valid.txt`, `answer_valid.txt`.
 
 ### 3. Train KenLM
 
 ```bash
 # 6-gram model with pruning (adjust order / prune thresholds as needed)
 lmplz --verbose_header -o 6 --prune 0 0 0 1 2 2 \
-    < data/madlad_multilang_clean_30k_optionB_kenlm/train.txt \
+    < data/madlad_multilang_clean_35k_optionB_kenlm/train.txt \
     > work/char6_pruned.arpa
 
 build_binary work/char6_pruned.arpa work/char6.binary
 ```
 
-Update `config.yaml` → `model.binary` to point to the new binary.
+Update `config.yaml` -> `model.binary` to point to the new binary.
 
-### 4. Precompute KenLM top-K candidates (for reranker training)
+### 4. Precompute KenLM candidates (for reranker training)
 
-This scores every vocab token at every position in train/valid and writes TSVs used by the reranker.
+Scores every vocab token at every position in train/valid and writes TSVs used by the reranker as hard negatives.
 
 ```bash
-uv run python src/data/precompute_kenlm_candidates.py --split train --work_dir work --k 64
-uv run python src/data/precompute_kenlm_candidates.py --split valid --work_dir work --k 64
+uv run python src/data/precompute_kenlm_candidates.py --split train --k 64
+uv run python src/data/precompute_kenlm_candidates.py --split valid --k 64
 ```
 
-Update `config.yaml` → `reranker.data.candidates_train_path` and `candidates_valid_path` to the generated TSV paths.
+Update `config.yaml` -> `reranker.data.candidates_train_path` and `candidates_valid_path` to the generated TSV paths. See [src/data/README.md](src/data/README.md) for more options (stratified sampling, sibling gold exclusion, etc.).
 
 ### 5. Train the reranker
 
-All hyperparameters live in [`config.yaml`](config.yaml) under `reranker`. Key settings before a full run:
-
-- Set `data_limits.max_train_lines: null` and `data_limits.max_valid_lines: null` (no line cap)
-- Set `data_limits.max_train_examples: null` (use all examples)
-- Set `training.warmup_steps` appropriately (e.g. 500 for a full run)
+All hyperparameters live in [`config.yaml`](config.yaml) under `reranker`.
 
 ```bash
-uv run python src/train_reranker.py
+uv run python src/reranker/train.py
 ```
 
-Checkpoints are saved to `work/`. The inference checkpoint (for `myprogram.py`) is `work/reranker.pt`.
+Outputs:
+- `work/best_reranker.ckpt` — Lightning checkpoint (saved by callback on metric improvement)
+- `work/<checkpoint_name>.pt` — plain inference checkpoint (saved unconditionally at end of run, including on Ctrl+C)
 
----
+See [src/reranker/README.md](src/reranker/README.md) for details on dataset modes, config options, and checkpoint conversion.
 
+### 6. Run inference
 
-# CSE447-project
-
-This repo contains an example submission for the CSE447 project.
-For this project, you will develop a program that takes in a string of character and tries to predict the next character.
-For illustration purposes, this repo contains a dummy program that simply generates 3 random guesses of the next character.
-
-
-## Input format
-
-`example/input.txt` contains an example of what the input to your program will look like.
-Each line in this file correspond to a string, for which you must guess what the next character should be.
-
-## Output format
-
-`example/pred.txt` contains an example of what the output of your program must look like.
-Each line in this file correspond to guesses by the program of what the next character should be.
-In other words, line `i` in `example/pred.txt` corresponds to what character the program thinks should come after the string in line `i` of `example/pred.txt`.
-In this case, for each string, the program produces 3 guesses.
-
-
-## Implementing your program
-
-`src/myprogram.py` contains the example program, along with a simple commandline interface that allows for training and testing.
-This particular model only performs random guessing, hence the training step doesn't do anything, and is only shown for illustration purposes.
-During training, your may want to perform the following steps with your program:
-
-1. Load training data
-2. Train model
-3. Save trained model checkpoint
-
-During testing, we will give your program new (e.g. heldout, unreleased) test data, which has the same format as (but different content from) `example/input.txt`.
-In this case, your program must
-
-1. Load test data
-2. Load trained model checkpoint
-3. Predict answers for test data
-4. Save predictions
-
-`example/pred.txt` contains an example predictions file that is generated by `src/myprogram.py` for `example/input.txt`.
-
-
-Let's walk through how to use the example program. First we will train the model, telling the program to save intermediate results in the directory `work`:
-
-```
-python src/myprogram.py train --work_dir work
+```bash
+uv run python src/predict.py \
+    --work_dir work \
+    --test_data example/input.txt \
+    --test_output pred.txt
 ```
 
-Because this model doesn't actually require training, we simply saved a fake checkpoint to `work/model.checkpoint`.
-Next, we will generate predictions for the example data in `example/input.txt` and save it in `pred.txt`:
+`predict.py` reads model paths and inference settings from `config.yaml` automatically:
 
-```
-python src/myprogram.py test --work_dir work --test_data example/input.txt --test_output pred.txt
-```
+| config.yaml field (not exhaustive, look at top of `predict.py`) | what it controls |
+|---|---|
+| `model.binary` | KenLM binary path (relative to `--work_dir`) |
+| `model.vocab` | Vocabulary file path (relative to `--work_dir`) |
+| `reranker.output.checkpoint_name` | Reranker `.pt` path (relative to `--work_dir`); if absent, falls back to KenLM-only |
+| `reranker.training.candidate_size` | Top-K candidates passed from KenLM to the reranker |
+| `reranker.training.eval_batch_size` | Batch size for reranker forward passes |
 
-## Evaluating your predictions
+`max_context_len` is read from the reranker checkpoint itself, so it always matches the value the model was trained with.
 
-We will evaluate your predictions by checking it against a gold answer key.
-The gold answer key for the example data can be found in `example/answer.txt`.
-Essentially, your guess is correct if the correct next character is one of your guesses.
-For simplicity, we will check caseless matches (e.g. it doesn't matter if you guess uppercase or lowercase).
+Optional CLI overrides:
 
-Let's see what the random guessing program gets:
+- `--kenlm-only` — skip the reranker even if a checkpoint exists
+- `--alpha <float>` — override the KenLM blend weight saved in the checkpoint
+- `--device cpu|cuda` — force a device (auto-detected by default)
 
-```
-python grader/grade.py example/pred.txt example/answer.txt --verbose
-```
+### 7. Grade predictions
 
-You should see a detailed answer, as well as a success rate.
-
-
-# Submitting your project
-
-To facilitate reproducibility, we will rely on containerization via Docker. Docker is used to create a consistent environment for developing and running the ML model across different systems. 
-Essentially, we will use Docker to guarantee that we can run your program. 
-If you do not have Docker installed, please install it by following [these instructions](https://docs.docker.com/get-docker/).
-We will not be doing anything very fancy with Docker.
-In fact, we provide you with a starter `Dockerfile`.
-You should install any dependencies in this Dockerfile you require to perform prediction. 
-
-The current Dockerfile creates a Docker image using "pytorch/pytorch:1.6.0-cuda10.1-cudnn7-runtime" which is a very old version of pytorch. 
-You might need to **change this docker image**. Many pre-built images (which already include multiple common dependencies) are available here – [https://hub.docker.com/](https://hub.docker.com/) (e.g., tensorflow, huggingface or even a simple python base)
-
-> You can add additional packages that your code needs using a similar line: `RUN pip install numpy pandas scipy` 
-> 
-> If you are working in a Python/conda environment and have a list of packages, you can also install dependencies easily from a requirements.txt file placed in the same folder as Dockerfile. Add these two lines to the > Dockerfile to automatically install the correct versions of your project dependencies.
-> ```
-> COPY requirements.txt /job/ 
-> RUN pip install -r requirements.txt
-> ```
-> **Remember to add** `cp requirements.txt submit/requirements.txt` **in submit.sh if you are using this file.**
-
-You must submit the project to Canvas as a zip file (named without whitespace). 
-* Follow the format: **Project447GroupN.zip** where N is your Group no.
-* It should contain the following:
-
-```
-src  # source code directory for your program
-work  # checkpoint directory for your program, which contains any intermediate result you require to perform prediction, such as model parameters
-Dockerfile  # your Dockerfile
-team.txt  # your team information
-pred.txt  # your predictions for the example data `example/input.txt`
+```bash
+uv run python scripts/grade.py \
+    --pred pred.txt \
+    --answer example/answer.txt \
+    --top-k 3
 ```
 
-For reference, the script `submit.sh` will package this example project for submission. 
-* **Remember to update your names and netIDs** in `submit.sh`
-* **Remember to rename your zip file** before uploading it to Canvas.
+## Submission
 
-In `team.txt`, your names and NetIDs should appear in the following format:
-
-```
-Name1,NetID1
-Name2,NetID2
-Name3,NetID3
+```bash
+bash submit.sh
 ```
 
-Your `src` directory must contain a `predict.sh` file, which, when executed as `bash src/predict.sh <path_to_test_data> <path_to_predictions>` must write predictions to the file `<path_to_predictions>`.
-For reference, the `predict.sh` file for this example project is in `src/predict.sh`
-Although we encourage you to follow conventions in the example project, it is not necessary to do so.
-*What is necessary is that `predict.sh` generates predictions according to spec*.
+Builds `submit.zip` with the model files and source code, runs inference on the example data, and grades the output.
 
-On our end, we will extract this zip file and run the following command inside the unzipped directory.
-You should make sure that this works on your end.
-For example, you may consider going to a new directory, unzipping your submission zip file, and running the same command using the example data (e.g. set `<path_to_test_data>` to `$PWD/example`).
+## Configuration
 
-```
-mkdir -p output
-docker build -t cse447-proj/demo -f Dockerfile .
-docker run --rm -v $PWD/src:/job/src -v $PWD/work:/job/work -v <path_to_test_data>:/job/data -v $PWD/output:/job/output cse447-proj/demo bash /job/src/predict.sh /job/data/input.txt /job/output/pred.txt
-```
-
-If you are curious what these flags in `docker run` mean:
-
-- `--rm` remove container after running
-- `-v a:b` mount `a` in host machine (e.g. path on your machine outside docker) to the container (e.g. path in the docker container).
-
-Running this command will produce `output/pred.txt`, which we take to be your predictions on the heldout test data.
-We will then evaluate your success rate against the heldout answer key using `grader/grade.py`.
-
-Your performance will contain two metrics obtained on the heldout test data, the first being the success rate, the second being the run time.
-Your run time is calculated as the time it takes us to run the `docker run` command.
-
-For convenience, we have put the command we will likely run to grade your assignment in `grader/grade.sh`.
-You should be able to emulate the grading using the example data by running `bash grader/grade.sh example`, which will write your results to the `output` directory.
-
-
-## Questions
-As more questions come in, we will create a FAQ here.
-In the mean time, please post your questions to edStem with the tag `Projects (447)`.
-
-Can we have 2 or 4 instead of 3 members?
-> We strongly prefer that you have 3 members. If you would really like to have a group of 4, please instead do two groups of 2.
-
-Will we get help in selecting datasets? Could we also get tips on finding good corpora?
-> Not at this time. Choosing and preprocessing your data is a key component of practising NLP in the real world and we would like you to experience it first hand.
-
-Is there a maximum processing time limit?
-> Yes, tentatively 30 minutes to run the test data. We will release the sample size soon, it should be tentatively a few thousand samples.
-
-Is there a maximum size limit for the program?
-> Yes, tentatively 1 MB for `src` and ~3 GB for your checkpoint. Your docker image can be ~5 GB.
-
-What does it mean the astronaut "speaks at least one human language"? Will system support mix language .. like mix of English + a different language?
-> Your program may receive input that is not English. The input may be a mix of English and other languages.
-
-Can test sentences be virtually anything? e.g. they intentionally test robustness
-> Test sentences will not be adversarial. They will be reasonable dialogue utterances.
-
-Do we have an unlimited appendix for the final report, such as a one-page report with a 10-page clarification?
-> No. There will be no appendix.
+- [`config.yaml`](config.yaml) — KenLM inference settings, multiprocessing workers, wandb logging, and all reranker architecture/training hyperparameters
+- [`data_config.yaml`](data_config.yaml) — dataset download parameters (languages, sample counts, text length filters) and preprocessing settings

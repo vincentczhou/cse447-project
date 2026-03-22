@@ -68,7 +68,7 @@ def _worker_init(model_path: str, vocab: list[str], k: int):
 
 
 def _predict_single(inp: str) -> str:
-    """Predict top 3 next characters for a single input. Runs in worker process."""
+    """Predict top k next characters for a single input. Runs in worker process."""
     try:
         tokens = input_to_tokens(inp)
 
@@ -88,11 +88,11 @@ def _predict_single(inp: str) -> str:
             scored.append((log_prob, token))
 
         # Get top k by log probability
-        top3 = heapq.nlargest(_worker_k, scored, key=lambda x: x[0])
+        topk = heapq.nlargest(_worker_k, scored, key=lambda x: x[0])
 
         # Convert tokens back to characters
         chars = []
-        for _, token in top3:
+        for _, token in topk:
             if token == SPACE_TOKEN:
                 chars.append(" ")
             else:
@@ -116,11 +116,12 @@ class MyModel:
 
     @classmethod
     def load_training_data(cls):
-        # KenLM training is done offline with lmplz
+        """No-op — KenLM training is done offline with lmplz."""
         return []
 
     @classmethod
     def load_test_data(cls, fname):
+        """Load test data from file, one input per line."""
         data = []
         with open(fname) as f:
             for line in f:
@@ -130,13 +131,14 @@ class MyModel:
 
     @classmethod
     def write_pred(cls, preds, fname):
+        """Write predictions file, one prediction per line."""
         Path(fname).parent.mkdir(parents=True, exist_ok=True)
         with open(fname, "wt") as f:
             for p in preds:
                 f.write("{}\n".format(p))
 
     def run_train(self, data, work_dir):
-        # KenLM training is done offline with lmplz
+        """No-op — KenLM training is done offline with lmplz."""
         pass
 
     def run_pred(self, data, k: int = _DEFAULT_K):
@@ -170,8 +172,7 @@ class MyModel:
             return [_predict_single(inp) for inp in data]
 
     def save(self, work_dir):
-        # your code here
-        # this particular model has nothing to save, but for demonstration purposes we will save a blank file
+        """Save a dummy checkpoint file (KenLM model is the binary itself)."""
         with open(os.path.join(work_dir, "model.checkpoint"), "wt") as f:
             f.write("dummy save")
 

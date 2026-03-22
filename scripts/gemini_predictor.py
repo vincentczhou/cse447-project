@@ -92,6 +92,7 @@ class CharPrediction(BaseModel):
 
 
 def build_prompt(text: str) -> str:
+    """Build the Gemini prompt from an input text, truncating to CONTEXT_LIMIT."""
     trimmed = text if len(text) <= CONTEXT_LIMIT else "…" + text[-CONTEXT_LIMIT:]
     return f'Predict the next character for this partial text:\n"{trimmed}"'
 
@@ -103,6 +104,7 @@ async def predict_single(
     config: types.GenerateContentConfig,
     cache: dict[str, str],
 ) -> tuple[str, float, bool]:
+    """Predict next 3 characters for one input, with retries and caching."""
     if text in cache:
         return cache[text], 0.0, False
 
@@ -148,7 +150,8 @@ async def predict_all(
     out_f,
     cache: dict[str, str],
     cache_path: Path,
-) -> tuple[list[str], float]:
+) -> tuple[list[str], float, int]:
+    """Run predictions for all inputs concurrently, streaming results to out_f."""
     print(f"  {len(inputs)} inputs (concurrency={concurrency})")
 
     semaphore = asyncio.Semaphore(concurrency)
@@ -196,11 +199,13 @@ async def predict_all(
 
 
 def load_lines(path: str) -> list[str]:
+    """Read a text file, returning one string per line (newlines stripped)."""
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
 
 
 def load_cache(path: Path) -> dict[str, str]:
+    """Load prediction cache from JSON file, returning empty dict on failure."""
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -210,10 +215,12 @@ def load_cache(path: Path) -> dict[str, str]:
 
 
 def save_cache(cache: dict[str, str], path: Path) -> None:
+    """Persist prediction cache to JSON file."""
     path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
 def grade(preds: list[str], golds: list[str], verbose: bool = False) -> float:
+    """Compute top-3 accuracy: fraction of golds found in the first 3 predicted chars."""
     correct = 0
     for i, (p, g) in enumerate(zip(preds, golds)):
         hit = g.lower() in p[:3].lower()

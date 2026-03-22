@@ -23,10 +23,11 @@ from pathlib import Path
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from utils.text_utils import normalize_text, char_tokenize
+from utils.text_utils import char_tokenize, normalize_text
 
 
 def load_lines(path: str) -> list[str]:
+    """Read a text file, returning one string per line (newlines stripped)."""
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
 
@@ -62,11 +63,11 @@ def main():
     with out.open("a", encoding="utf-8") as f:
         for ext_path in args.ext:
             raw_lines = load_lines(ext_path)
-            tokenized = [
-                char_tokenize(normalize_text(line))
-                for line in tqdm(raw_lines, desc=f"Tokenizing {ext_path}")
-                if normalize_text(line)
-            ]
+            tokenized = []
+            for line in tqdm(raw_lines, desc=f"Tokenizing {ext_path}"):
+                text = normalize_text(line, preserve_trailing_space=True)
+                if text:
+                    tokenized.append(char_tokenize(text))
             for _ in range(args.repeat):
                 for line in tokenized:
                     f.write(line + "\n")

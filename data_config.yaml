@@ -1,72 +1,72 @@
-data_dir: data
+data_dir: data                 # Root directory for all dataset outputs (relative to repo root)
 
 builddataset:
-  seed: 42
-  target_per_lang: 35000
-  min_chars: 16
-  max_chars: 2048
-  max_per_lang_scan: 200000
-  patience_per_lang: 50000
-  shard_rows: 20000
-  output_dir: madlad_multilang_clean_35k_optionB
-  langs:
-    - en
-    - es
-    - fr
-    - de
-    - pt
-    - it
-    - nl
-    - sv
-    - da
-    - no
-    - fi
-    - pl
-    - cs
-    - sk
-    - hu
-    - ro
-    - bg
-    - sr
-    - hr
-    - sl
-    - lt
-    - lv
-    - et
-    - el
-    - uk
-    - ru
-    - ar
-    - he
-    - fa
-    - tr
-    - hi
-    - bn
-    - ur
-    - ta
-    - te
-    - mr
-    - gu
-    - pa
-    - ne
-    - si
-    - th
-    - vi
-    - id
-    - ms
-    - zh
-    - ja
-    - ko
-    - sw
-    - ha
-    - yo
-    - ig
-    - am
-    - so
+  seed: 42                     # Random seed for reproducibility
+  target_per_lang: 35000       # Target number of samples to collect per language
+  min_chars: 16                # Minimum text length in characters (shorter texts are rejected)
+  max_chars: 2048              # Maximum text length in characters (longer texts are truncated)
+  max_per_lang_scan: 200000    # Maximum documents to scan per language before giving up
+  patience_per_lang: 50000     # Stop scanning a language after this many consecutive rejections
+  shard_rows: 20000            # Number of rows per parquet shard file
+  output_dir: madlad_multilang_clean_35k_optionB  # Output directory name (under data_dir)
+  langs:                       # IETF language codes to collect from MADLAD-400
+    - en   # English
+    - es   # Spanish
+    - fr   # French
+    - de   # German
+    - pt   # Portuguese
+    - it   # Italian
+    - nl   # Dutch
+    - sv   # Swedish
+    - da   # Danish
+    - no   # Norwegian
+    - fi   # Finnish
+    - pl   # Polish
+    - cs   # Czech
+    - sk   # Slovak
+    - hu   # Hungarian
+    - ro   # Romanian
+    - bg   # Bulgarian
+    - sr   # Serbian
+    - hr   # Croatian
+    - sl   # Slovenian
+    - lt   # Lithuanian
+    - lv   # Latvian
+    - et   # Estonian
+    - el   # Greek
+    - uk   # Ukrainian
+    - ru   # Russian
+    - ar   # Arabic
+    - he   # Hebrew
+    - fa   # Persian
+    - tr   # Turkish
+    - hi   # Hindi
+    - bn   # Bengali
+    - ur   # Urdu
+    - ta   # Tamil
+    - te   # Telugu
+    - mr   # Marathi
+    - gu   # Gujarati
+    - pa   # Punjabi
+    - ne   # Nepali
+    - si   # Sinhala
+    - th   # Thai
+    - vi   # Vietnamese
+    - id   # Indonesian
+    - ms   # Malay
+    - zh   # Chinese
+    - ja   # Japanese
+    - ko   # Korean
+    - sw   # Swahili
+    - ha   # Hausa
+    - yo   # Yoruba
+    - ig   # Igbo
+    - am   # Amharic
+    - so   # Somali
 
 preprocess:
-  seed: 42
-  valid_ratio: 0.01
-  flush_interval: 10000
-  input_dir: madlad_multilang_clean_35k_optionB
-  output_dir: madlad_multilang_clean_35k_optionB_kenlm
+  seed: 42                     # Random seed for train/valid split
+  valid_ratio: 0.01            # Fraction of data reserved for validation (1%)
+  flush_interval: 10000        # Write output files to disk every N lines
+  input_dir: madlad_multilang_clean_35k_optionB   # Input dataset directory (output of builddataset.py, under data_dir)
+  output_dir: madlad_multilang_clean_35k_optionB_kenlm  # Output directory for tokenized files (under data_dir)

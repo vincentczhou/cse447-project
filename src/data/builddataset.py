@@ -1,3 +1,9 @@
+"""Download multilingual text from MADLAD-400 and save as a HuggingFace Dataset.
+
+Collects TARGET_PER_LANG samples per language, filtering by character length,
+and writes sharded parquet files plus CSV summaries.
+"""
+
 from datasets import load_dataset, Dataset, Features, Value
 from collections import defaultdict
 from pathlib import Path
@@ -41,6 +47,7 @@ rejected = []  # unsupported language codes or load failures
 
 
 def flush_shard():
+    """Write buffered rows to a parquet shard file and reset the buffer."""
     global shard_idx, buffer
     if not buffer:
         return

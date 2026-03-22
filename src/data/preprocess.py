@@ -1,3 +1,10 @@
+"""Preprocess a HuggingFace dataset into character-tokenized files for KenLM.
+
+Loads the dataset built by builddataset.py, normalizes text (NFC, lowercase,
+whitespace collapse), tokenizes to character level (spaces -> <sp>), splits
+into train/valid, and writes tokenized .txt files plus a vocabulary JSON.
+"""
+
 import sys
 from collections import Counter
 from datasets import load_dataset

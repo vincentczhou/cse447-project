@@ -25,6 +25,7 @@ import kenlm
 import torch
 import yaml
 
+from reranker import PAD_ID, UNK_ID, load_for_inference
 from utils.text_utils import SPACE_TOKEN, input_to_tokens
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,6 @@ CHUNK_DIVISOR = CONFIG["workers"]["chunk_divisor"]
 
 _RERANKER_CFG = CONFIG.get("reranker", {})
 CANDIDATE_K = _RERANKER_CFG.get("training", {}).get("candidate_size", 64)
-MAX_CONTEXT_LEN = _RERANKER_CFG.get("architecture", {}).get("max_context_len", 200)
 RERANKER_CHECKPOINT = _RERANKER_CFG.get("output", {}).get(
     "checkpoint_name", "reranker.pt"
 )
@@ -133,7 +133,6 @@ def _rerank_batched(
     Returns:
         list of top_n-character prediction strings, one per input.
     """
-    from train_reranker import PAD_ID, UNK_ID
 
     N = len(kenlm_results)
     preds = [FALLBACK_PRED] * N
@@ -214,7 +213,7 @@ class TwoStagePredictor:
         self.reranker_stoi: dict[str, int] | None = None
         self.device: torch.device | None = None
         self.candidate_k = CANDIDATE_K
-        self.max_context_len = MAX_CONTEXT_LEN
+        self.max_context_len: int | None = None
 
     @classmethod
     def load(cls, work_dir: str, device: str | None = None) -> TwoStagePredictor:
@@ -248,11 +247,10 @@ class TwoStagePredictor:
         # Reranker (optional)
         reranker_path = work_path / RERANKER_CHECKPOINT
         if reranker_path.exists():
-            from train_reranker import load_for_inference
-
             model, _tokens, stoi = load_for_inference(reranker_path, instance.device)
             instance.reranker = model
             instance.reranker_stoi = stoi
+            instance.max_context_len = model.cfg.max_context_len
             print(f"Reranker loaded from {reranker_path} on {instance.device}")
         else:
             print(f"No reranker at {reranker_path}, using KenLM-only mode")
@@ -355,6 +353,12 @@ if __name__ == "__main__":
     parser.add_argument("--test_output", default="pred.txt", help="output predictions")
     parser.add_argument("--device", default=None, help="torch device (auto if omitted)")
     parser.add_argument("--kenlm-only", action="store_true", help="skip reranker")
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Override reranker alpha (KenLM blend weight). Overrides the value saved in the checkpoint.",
+    )
     args = parser.parse_args()
 
     preds = []
@@ -366,6 +370,10 @@ if __name__ == "__main__":
         if args.kenlm_only:
             predictor.reranker = None
             print("Forced KenLM-only mode")
+
+        if args.alpha is not None and predictor.reranker is not None:
+            predictor.reranker.alpha = args.alpha
+            print(f"Alpha overridden to {args.alpha}")
 
         print(f"Loading test data from {args.test_data}")
         test_data = TwoStagePredictor.load_test_data(args.test_data)

@@ -36,6 +36,7 @@ from tqdm import tqdm
 
 
 def load_lines(path: str) -> list[str]:
+    """Read a text file, returning one string per line (newlines stripped)."""
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
 
@@ -43,6 +44,7 @@ def load_lines(path: str) -> list[str]:
 def grade(
     preds: list[str], golds: list[str], top_k: int, verbose: bool = False
 ) -> float:
+    """Compute top-k accuracy: fraction of golds found in the first top_k predicted chars."""
     correct = 0
     for i, (p, g) in enumerate(zip(preds, golds)):
         hit = g.lower() in p[:top_k].lower()

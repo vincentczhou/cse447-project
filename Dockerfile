@@ -30,7 +30,7 @@ COPY pyproject.toml uv.lock .python-version ./
 COPY data_config.yaml config.yaml ./
 
 # Copy .env files
-COPY .env ./
+# COPY .env ./
 
 # Make sure torch is still visible in the venv
 RUN uv venv --system-site-packages --clear
