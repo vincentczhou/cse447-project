@@ -125,13 +125,15 @@ For example, you may consider going to a new directory, unzipping your submissio
 ```
 mkdir -p output
 docker build -t cse447-proj/demo -f Dockerfile .
-docker run --rm -v $PWD/src:/job/src -v $PWD/work:/job/work -v <path_to_test_data>:/job/data -v $PWD/output:/job/output cse447-proj/demo bash /job/src/predict.sh /job/data/input.txt /job/output/pred.txt
+docker run --gpus all --rm -v $PWD/src:/job/src -v $PWD/work:/job/work -v <path_to_test_data>:/job/data -v $PWD/output:/job/output cse447-proj/demo bash /job/src/predict.sh /job/data/input.txt /job/output/pred.txt
 ```
 
 If you are curious what these flags in `docker run` mean:
-
+- `--gpus all` assign all available gpus to the container
 - `--rm` remove container after running
 - `-v a:b` mount `a` in host machine (e.g. path on your machine outside docker) to the container (e.g. path in the docker container).
+
+If with the `--gpus all` flag your code throws an error that indicates that your submission is incompatible with gpu usage, we will retry without the `--gpus all` flag. This will not affect your runtime; we re-measure from the new docker run command.
 
 Running this command will produce `output/pred.txt`, which we take to be your predictions on the heldout test data.
 We will then evaluate your success rate against the heldout answer key using `grader/grade.py`.
