@@ -9,5 +9,3 @@ submit.zip
 .env
 wandb/
 *.zip
-*.arpa
-*.binary

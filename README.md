@@ -1,77 +1,18 @@
 # Notes (Spec Below)
 
-## Setup
+to setup
 
-Install [KenLM](https://github.com/kpu/kenlm), then:
-
-```bash
+Install KenLM, run
+```
 uv sync
 uv run pre-commit install
 ```
 
----
-
-## Full Pipeline
-
-### 1. Download and build the dataset
-
-Settings (languages, samples per language, etc.) live in [`data_config.yaml`](data_config.yaml) under `builddataset`.
-
-```bash
-uv run python src/data/builddataset.py
+training with kenlm
 ```
-
-Output: `data/madlad_multilang_clean_30k_optionB/`
-
-### 2. Preprocess for KenLM (character tokenization)
-
-Settings live in [`data_config.yaml`](data_config.yaml) under `preprocess`.
-
-```bash
-uv run python src/data/preprocess.py
+lmplz --verbose_header -o 6 --prune 0 0 0 1 2 2 < data/madlad_multilang_clean_1k_optionB_kenlm/train.txt > char6_pruned.arpa
+build_binary char6_pruned.arpa char6.binaryu
 ```
-
-Output: `data/madlad_multilang_clean_30k_optionB_kenlm/` with `train.txt`, `valid.txt`, `vocab.json`, `input_valid.txt`, `answer_valid.txt`.
-
-### 3. Train KenLM
-
-```bash
-# 6-gram model with pruning (adjust order / prune thresholds as needed)
-lmplz --verbose_header -o 6 --prune 0 0 0 1 2 2 \
-    < data/madlad_multilang_clean_30k_optionB_kenlm/train.txt \
-    > work/char6_pruned.arpa
-
-build_binary work/char6_pruned.arpa work/char6.binary
-```
-
-Update `config.yaml` → `model.binary` to point to the new binary.
-
-### 4. Precompute KenLM top-K candidates (for reranker training)
-
-This scores every vocab token at every position in train/valid and writes TSVs used by the reranker.
-
-```bash
-uv run python src/data/precompute_kenlm_candidates.py --split train --work_dir work --k 64
-uv run python src/data/precompute_kenlm_candidates.py --split valid --work_dir work --k 64
-```
-
-Update `config.yaml` → `reranker.data.candidates_train_path` and `candidates_valid_path` to the generated TSV paths.
-
-### 5. Train the reranker
-
-All hyperparameters live in [`config.yaml`](config.yaml) under `reranker`. Key settings before a full run:
-
-- Set `data_limits.max_train_lines: null` and `data_limits.max_valid_lines: null` (no line cap)
-- Set `data_limits.max_train_examples: null` (use all examples)
-- Set `training.warmup_steps` appropriately (e.g. 500 for a full run)
-
-```bash
-uv run python src/train_reranker.py
-```
-
-Checkpoints are saved to `work/`. The inference checkpoint (for `myprogram.py`) is `work/reranker.pt`.
-
----
 
 
 # CSE447-project
