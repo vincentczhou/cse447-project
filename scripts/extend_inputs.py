@@ -7,10 +7,11 @@ produces three output files where each line is the original input
 concatenated with the 1st, 2nd, or 3rd predicted character respectively.
 
 Usage:
-    python scripts/extend_inputs.py \
-        --input  output/test_input.txt \
-        --pred   output/gemini_pred.txt \
-        --outdir output/
+    uv run python scripts/extend_inputs.py \
+        --input  work/distill_input.txt \
+        --pred   work/distill_preds.txt \
+        --outdir work/
+    # produces work/distill_input_ext1.txt, _ext2.txt, _ext3.txt
 """
 
 import argparse
