@@ -1,6 +1,6 @@
 import sys
 from collections import Counter
-from datasets import load_dataset
+from datasets import Dataset
 import json
 from pathlib import Path
 import random
@@ -29,8 +29,7 @@ INPUT_DIR = DATA_DIR / pre_cfg["input_dir"]
 OUTPUT_DIR = DATA_DIR / pre_cfg["output_dir"]
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-parquet_files = sorted(str(p) for p in (INPUT_DIR / "parts").glob("part-*.parquet"))
-ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
+ds = Dataset.load_from_disk(str(INPUT_DIR))
 rng = random.Random(SEED)
 
 train_path = OUTPUT_DIR / "train.txt"

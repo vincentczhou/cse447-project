@@ -19,13 +19,12 @@ Reads GEMINI_API_KEY / GOOGLE_API_KEY from environment or a .env file in
 the project root.
 
 Usage:
-    uv run python scripts/gemini_predictor.py \
+    python scripts/gemini_predictor.py \
         --input       example/input.txt \
         --output      output/gemini_pred.txt \
         --answer      example/answer.txt   # optional – prints accuracy
-        --api-key     YOUR_KEY             # optional – or set GEMINI_API_KEY env var
         --sample      100                  # optional – randomly sample N inputs
-        --concurrency 150                  # optional – max parallel requests (default: 150)
+        --concurrency 20                   # optional – max parallel requests
         --verbose                          # optional – per-line grading output
         --eval-only                        # optional – skip prediction, just grade
 """

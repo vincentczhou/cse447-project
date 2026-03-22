@@ -6,10 +6,10 @@ Each row's "input" field is written as a single line (internal newlines
 replaced with a space). The "prediction" field is written the same way.
 
 Usage:
-    uv run python scripts/parse_predictions_table.py \
+    python scripts/parse_predictions_table.py \
         --table  predictions.table.json \
-        --input  work/distill_input.txt \
-        --pred   work/distill_preds.txt   # optional
+        --input  output/test_input.txt \
+        --pred   output/test_pred.txt   # optional
 """
 
 import argparse
