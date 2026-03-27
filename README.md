@@ -2,7 +2,7 @@
 
 Two-stage character-level next-character prediction system for multilingual text. Given a partial string, predicts the three most likely next characters (character autocomplete).
 
-This implementation achieved **1st** out of **75 teams (211 participants)**, achieving a `0.9618` success rate and `167.2117` seconds runtime.
+This implementation achieved **1st** out of **75 teams (211 participants)** with a `0.9618` success rate and `167.2117` seconds runtime.
 
 <p align="center">
   <img src="graph.png" alt="Success Rate vs Runtime" />
