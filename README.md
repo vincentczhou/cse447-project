@@ -2,7 +2,13 @@
 
 Two-stage character-level next-character prediction system for multilingual text. Given a partial string, predicts the three most likely next characters (character autocomplete).
 
-See [SPECIFICATION.md](SPECIFICATION.md) for the original [CSE 447 project](https://minneker.github.io/nlp-26wi/projects/447-project/) specification.
+This implementation achieved **1st** out of **75 teams (211 participants)**, achieving a `0.9618` success rate and `167.2117` seconds runtime.
+
+<p align="center">
+  <img src="graph.png" alt="Success Rate vs Runtime" />
+</p>
+
+See [SPECIFICATION.md](SPECIFICATION.md) for the original [CSE 447 project](https://minneker.github.io/nlp-26wi/projects/447-project/) specification. Also, the closely related [Interstellar Autocomplete Challenge](https://github.com/waterloo-nlp/intro-to-nlp-project).
 
 **Stage 1 — KenLM**: An n-gram language model scores all vocabulary tokens and returns the top-K candidates.
 
